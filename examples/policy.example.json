@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "profiles": {
+    "example-api": {
+      "origin": "https://api.example.invalid",
+      "media_type": "application/json",
+      "credentials": [
+        {
+          "service": "com.example.keychain-api.demo",
+          "account": "api-token",
+          "type": "bearer"
+        }
+      ],
+      "operations": [
+        {
+          "method": "GET",
+          "path": "/v1/status",
+          "body": "none",
+          "response": "json"
+        },
+        {
+          "method": "POST",
+          "path": "/v1/items",
+          "body": "json",
+          "response": "json"
+        },
+        {
+          "methods": [
+            "GET"
+          ],
+          "path_prefix": "/v1/items/",
+          "body": "none",
+          "response": "json-or-empty"
+        }
+      ]
+    }
+  }
+}
