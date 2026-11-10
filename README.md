@@ -6,11 +6,11 @@ The executable is intentionally narrow. Every profile fixes the destination orig
 
 ## Requirements
 
-- macOS 12 or newer
-- Xcode Command Line Tools with Swift 5.7 or newer
+- macOS 12 or newer; optional SOCKS proxy support requires macOS 14 or newer
+- Xcode Command Line Tools with Swift 5.9 and the macOS 14 SDK or newer
 - A generic-password item in the default login Keychain
 
-The current source has no third-party dependencies. It uses Foundation, Security, and LocalAuthentication.
+The current source has no third-party dependencies. It uses Foundation, Security, LocalAuthentication, and Network.
 
 ## Build
 
@@ -59,6 +59,7 @@ xcrun swiftc \
   Sources/KeychainAPI/KeychainAPI.swift \
   -framework Security \
   -framework LocalAuthentication \
+  -framework Network \
   -o build/keychain-api
 strip -x build/keychain-api
 codesign --force --sign - --options runtime \
@@ -120,6 +121,22 @@ An operation uses either:
 Supported methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE`. Body policies are `none`, `json`, and `optional-json`. Response policies are `json`, `empty`, and `json-or-empty`.
 
 Origins must use HTTPS. Redirects are refused, TLS 1.2 or newer is required, request bodies are limited to 1 MiB, and responses are limited to 8 MiB.
+
+### Optional SOCKS proxy
+
+On macOS 14 or newer, a profile can route its requests through a local SOCKSv5 listener, such as an SSH dynamic forward:
+
+```json
+"proxy": {
+  "type": "socks5",
+  "host": "127.0.0.1",
+  "port": 49153
+}
+```
+
+Start and stop the listener separately; the helper does not manage SSH sessions. The proxy host must be `127.0.0.1` and its port must be between 1024 and 65535. Proxy credentials and fallback/exclusion options are not accepted. Requests fail if the configured proxy is unavailable; direct fallback is disabled.
+
+The original HTTPS origin, certificate validation, credential mapping, and operation allowlist still apply. Proxy mode requires a DNS origin and rejects IP literals, single-label names, and `.local`, `.localhost`, or `.localdomain` origins because macOS can bypass proxies for local destinations. A policy containing a proxy entry requires macOS 14 or newer. Profiles without a `proxy` field retain their existing transport behavior. No system proxy settings are changed.
 
 ## Add a Keychain item
 
@@ -216,7 +233,7 @@ An error can leave an empty, partial, or complete file, which is deliberately re
 keychain-api self-test
 ```
 
-It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
+It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged, validates proxy policy, and verifies that supported proxy sessions disable direct fallback. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
 
 ## Exit codes
 
@@ -233,7 +250,8 @@ It uses inert fixtures to check response redaction and policy validation, protec
 
 - macOS only.
 - JSON APIs only.
-- No redirects, cookies, proxies configured by this tool, streaming responses, or arbitrary request headers.
+- No redirects, cookies, streaming responses, or arbitrary request headers.
+- Explicit proxy support is limited to a loopback SOCKSv5 listener on macOS 14 or newer.
 - Response redaction is defense in depth, not a substitute for a narrowly scoped policy and API credential.
 
 See [SECURITY.md](SECURITY.md) before using the tool with sensitive accounts.
