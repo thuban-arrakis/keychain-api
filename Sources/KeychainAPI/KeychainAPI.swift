@@ -2,6 +2,7 @@ import Foundation
 import Security
 import LocalAuthentication
 import Darwin
+import Network
 
 private let maximumPolicyBytes = 1 * 1024 * 1024
 private let maximumBodyBytes = 1 * 1024 * 1024
@@ -475,10 +476,31 @@ private struct OperationPolicy {
     }
 }
 
+private struct SOCKSProxyPolicy {
+    let port: UInt16
+}
+
+private func parseSOCKSProxy(_ raw: Any?) throws -> SOCKSProxyPolicy? {
+    guard let raw else { return nil }
+    guard let dictionary = raw as? [String: Any],
+          hasOnlyKeys(dictionary, allowed: ["type", "host", "port"]),
+          dictionary["type"] as? String == "socks5",
+          dictionary["host"] as? String == "127.0.0.1",
+          let port = dictionary["port"] as? Int,
+          (1024...65535).contains(port) else {
+        throw fail("A policy profile contains an invalid loopback SOCKS proxy.", exitCode: 3)
+    }
+    guard #available(macOS 14.0, *) else {
+        throw fail("Configured SOCKS proxy requires macOS 14 or newer; direct fallback is forbidden.", exitCode: 3)
+    }
+    return SOCKSProxyPolicy(port: UInt16(port))
+}
+
 private struct ProfilePolicy {
     let name: String
     let origin: URL
     let mediaType: JSONMediaType
+    let proxy: SOCKSProxyPolicy?
     let credentials: [CredentialPolicy]
     let operations: [OperationPolicy]
 }
@@ -688,7 +710,7 @@ private func parseOperation(_ raw: Any) throws -> OperationPolicy {
 }
 
 private func parseProfile(name: String, dictionary: [String: Any]) throws -> ProfilePolicy {
-    guard hasOnlyKeys(dictionary, allowed: ["origin", "media_type", "credentials", "operations"]),
+    guard hasOnlyKeys(dictionary, allowed: ["origin", "media_type", "proxy", "credentials", "operations"]),
           let rawCredentials = dictionary["credentials"] as? [Any],
           (1...8).contains(rawCredentials.count),
           let rawOperations = dictionary["operations"] as? [Any],
@@ -697,6 +719,19 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
     }
     let origin = try parseOrigin(dictionary["origin"])
     let mediaType = try parseJSONMediaType(dictionary["media_type"])
+    let proxy = try parseSOCKSProxy(dictionary["proxy"])
+    if proxy != nil {
+        // CFNetwork bypasses SOCKS for loopback destinations even with failover disabled.
+        // Limit this option to DNS API origins; never silently proxy a local/IP origin.
+        let dnsNamePattern = #"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+(?:[a-z]{2,63}|xn--[a-z0-9](?:[a-z0-9-]{0,57}[a-z0-9])?)$"#
+        guard let host = origin.host?.lowercased(),
+              host.count <= 253,
+              host.range(of: dnsNamePattern, options: .regularExpression) != nil,
+              !host.hasSuffix(".local"), !host.hasSuffix(".localhost"),
+              !host.hasSuffix(".localdomain") else {
+            throw fail("Configured SOCKS proxy requires a non-local DNS API origin.", exitCode: 3)
+        }
+    }
     let credentials = try rawCredentials.map(parseCredential)
     let operations = try rawOperations.map(parseOperation)
 
@@ -722,6 +757,7 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
         name: name,
         origin: origin,
         mediaType: mediaType,
+        proxy: proxy,
         credentials: credentials,
         operations: operations
     )
@@ -852,7 +888,14 @@ private final class RedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecke
 
 private final class APITransport {
     private let redirectBlocker = RedirectBlocker()
-    private lazy var session: URLSession = {
+    private let session: URLSession
+
+    init(proxy: SOCKSProxyPolicy? = nil) throws {
+        let configuration = try Self.sessionConfiguration(proxy: proxy)
+        session = URLSession(configuration: configuration, delegate: redirectBlocker, delegateQueue: nil)
+    }
+
+    static func sessionConfiguration(proxy: SOCKSProxyPolicy?) throws -> URLSessionConfiguration {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
         configuration.urlCache = nil
@@ -863,8 +906,21 @@ private final class APITransport {
         configuration.timeoutIntervalForResource = 45
         configuration.httpMaximumConnectionsPerHost = 2
         configuration.tlsMinimumSupportedProtocolVersion = .TLSv12
-        return URLSession(configuration: configuration, delegate: redirectBlocker, delegateQueue: nil)
-    }()
+        if let proxy {
+            guard #available(macOS 14.0, *) else {
+                throw fail("Configured SOCKS proxy requires macOS 14 or newer; direct fallback is forbidden.", exitCode: 3)
+            }
+            // The endpoint is deliberately not configurable beyond its loopback port.
+            var socks = ProxyConfiguration(socksv5Proxy: .hostPort(
+                host: "127.0.0.1", port: NWEndpoint.Port(rawValue: proxy.port)!
+            ))
+            socks.allowFailover = false
+            socks.excludedDomains = []
+            socks.matchDomains = []
+            configuration.proxyConfigurations = [socks]
+        }
+        return configuration
+    }
 
     deinit {
         session.invalidateAndCancel()
@@ -1094,6 +1150,83 @@ private func runSelfTest() throws {
     }
     guard invalidMediaTypeRejected else {
         throw fail("Self-test failed: JSON media-type restriction.")
+    }
+
+    guard try parseSOCKSProxy(nil) == nil else {
+        throw fail("Self-test failed: absent proxy policy.")
+    }
+    func requireProxyPolicyRefusal(_ action: () throws -> Void) throws {
+        do {
+            try action()
+        } catch let failure as SafeFailure where failure.exitCode == 3 {
+            return
+        }
+        throw fail("Self-test failed: unsafe proxy policy accepted.")
+    }
+    let proxyFixture: [String: Any] = ["type": "socks5", "host": "127.0.0.1", "port": 49153]
+    let profileFixture: [String: Any] = [
+        "origin": "https://api.example.invalid",
+        "credentials": [["service": "inert.test", "account": "inert", "type": "bearer"]],
+        "operations": [["method": "GET", "path": "/", "body": "none", "response": "json"]]
+    ]
+    guard try parseProfile(name: "fixture", dictionary: profileFixture).proxy == nil else {
+        throw fail("Self-test failed: unconfigured profile acquired a proxy.")
+    }
+    let unchanged = try APITransport.sessionConfiguration(proxy: nil)
+    for invalid: [String: Any] in [
+        ["type": "http", "host": "127.0.0.1", "port": 49153],
+        ["type": "socks5", "host": "localhost", "port": 49153],
+        ["type": "socks5", "host": "0.0.0.0", "port": 49153],
+        ["type": "socks5", "host": "192.0.2.1", "port": 49153],
+        ["type": "socks5", "host": "127.0.0.1", "port": 0],
+        ["type": "socks5", "host": "127.0.0.1", "port": 65536],
+        ["type": "socks5", "host": "127.0.0.1", "port": NSNumber(value: 49153.5)],
+        ["type": "socks5", "host": "127.0.0.1", "port": "49153"],
+        ["type": "socks5", "host": "127.0.0.1", "port": true],
+        ["type": "socks5", "host": "127.0.0.1", "port": 49153, "password": "INERT"],
+        ["type": "socks5", "host": "127.0.0.1", "port": 49153, "allow_failover": true]
+    ] {
+        try requireProxyPolicyRefusal { _ = try parseSOCKSProxy(invalid) }
+    }
+    if #available(macOS 14.0, *) {
+        guard let proxy = try parseSOCKSProxy(proxyFixture), proxy.port == 49153 else {
+            throw fail("Self-test failed: proxy policy parsing.")
+        }
+        var proxiedProfile = profileFixture
+        proxiedProfile["proxy"] = proxyFixture
+        guard try parseProfile(name: "fixture", dictionary: proxiedProfile).proxy?.port == 49153 else {
+            throw fail("Self-test failed: proxied profile parsing.")
+        }
+        for origin in [
+            "https://127.0.0.1", "https://[::1]", "https://localhost",
+            "https://api.localhost", "https://api.local", "https://api.localdomain",
+            "https://192.0.2.1", "https://0x7f.0.0.1", "https://0x7f.0x0.0x0.0x1",
+            "https://api.example.invalid.", "https://api..example.invalid"
+        ] {
+            try requireProxyPolicyRefusal {
+                var invalid = proxiedProfile
+                invalid["origin"] = origin
+                _ = try parseProfile(name: "fixture", dictionary: invalid)
+            }
+        }
+        let proxied = try APITransport.sessionConfiguration(proxy: proxy)
+        guard proxied.proxyConfigurations.count == 1,
+              !proxied.proxyConfigurations[0].allowFailover,
+              proxied.proxyConfigurations[0].excludedDomains.isEmpty,
+              proxied.proxyConfigurations[0].matchDomains.isEmpty,
+              proxied.tlsMinimumSupportedProtocolVersion == .TLSv12,
+              proxied.httpCookieStorage == nil,
+              proxied.urlCredentialStorage == nil else {
+            throw fail("Self-test failed: fail-closed proxy session configuration.")
+        }
+        guard unchanged.proxyConfigurations.isEmpty else {
+            throw fail("Self-test failed: unconfigured profile transport changed.")
+        }
+    } else {
+        try requireProxyPolicyRefusal { _ = try parseSOCKSProxy(proxyFixture) }
+        try requireProxyPolicyRefusal {
+            _ = try APITransport.sessionConfiguration(proxy: SOCKSProxyPolicy(port: 49153))
+        }
     }
 
     let capabilityURLFixture = sanitizedAPIObject([
@@ -1381,6 +1514,7 @@ private enum KeychainAPICLI {
                 guard options.secretOutputFile == nil || operation.response != .empty else {
                     throw fail("Secret output requires a JSON response policy.", exitCode: 2)
                 }
+                let transport = try APITransport(proxy: profile.proxy)
                 let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
 
                 var secrets = try profile.credentials.map(KeychainReader.value)
@@ -1389,7 +1523,6 @@ private enum KeychainAPICLI {
                         secrets[index].removeAll(keepingCapacity: false)
                     }
                 }
-                let transport = APITransport()
                 let result = try await transport.send(
                     profile: profile,
                     operation: operation,

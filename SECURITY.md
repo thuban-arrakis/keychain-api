@@ -10,6 +10,7 @@ Use a private GitHub security advisory for vulnerability reports. Do not include
 
 - Request authentication credentials live in the macOS login Keychain, not in the policy file. The opt-in response-file mode can save newly returned secrets as plaintext, as described below.
 - The policy file contains Keychain item references and an allowlist of HTTPS origins, methods, and paths. Treat changes to it as security-sensitive.
+- An optional per-profile SOCKSv5 proxy uses a loopback listener with direct fallback disabled. HTTPS certificate validation and origin restrictions still apply; credentials are not sent as proxy authentication. The helper does not manage or authenticate the local listener, which must be established through a trusted process. Proxying does not protect against a compromised local account or trusted TLS interception.
 - Request body files must contain non-secret JSON.
 - The tool intentionally refuses redirects, non-HTTPS origins, unexpected response types, oversized bodies, and responses echoing the configured request credentials. Normal output redacts recognized sensitive fields and credential-shaped values; this is not a guarantee that arbitrary response content contains no secrets.
 - This project has not undergone an independent security audit.
