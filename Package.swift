@@ -16,7 +16,8 @@ let package = Package(
             path: "Sources/KeychainAPI",
             linkerSettings: [
                 .linkedFramework("Security"),
-                .linkedFramework("LocalAuthentication")
+                .linkedFramework("LocalAuthentication"),
+                .linkedFramework("Network")
             ]
         )
     ]
