@@ -392,8 +392,31 @@ private final class ProtectedResponseFile {
 
 private enum CredentialPlacement {
     case bearer
+    case onePasswordServiceAccount
+    case apiKey
     case basic(username: String)
     case header(name: String, prefix: String)
+
+    var isOnePassword: Bool {
+        if case .onePasswordServiceAccount = self { return true }
+        return false
+    }
+
+    func requestHeader(secret: String) throws -> (name: String, value: String) {
+        switch self {
+        case .onePasswordServiceAccount:
+            throw fail("Service account tokens cannot be sent as HTTP headers.", exitCode: 3)
+        case .bearer:
+            return ("Authorization", "Bearer \(secret)")
+        case .apiKey:
+            return ("Authorization", "APIKey \(secret)")
+        case .basic(let username):
+            let encoded = Data((username + ":" + secret).utf8).base64EncodedString()
+            return ("Authorization", "Basic \(encoded)")
+        case .header(let name, let prefix):
+            return (name, prefix + secret)
+        }
+    }
 }
 
 private struct CredentialPolicy {
@@ -503,6 +526,10 @@ private struct ProfilePolicy {
     let proxy: SOCKSProxyPolicy?
     let credentials: [CredentialPolicy]
     let operations: [OperationPolicy]
+
+    var isOnePassword: Bool {
+        credentials.contains { $0.placement.isOnePassword }
+    }
 }
 
 private struct PolicyStore {
@@ -585,6 +612,20 @@ private func parseCredential(_ raw: Any) throws -> CredentialPolicy {
 
     let placement: CredentialPlacement
     switch type {
+    case "onepassword-service-account":
+        guard dictionary["header"] == nil,
+              dictionary["prefix"] == nil,
+              dictionary["username"] == nil else {
+            throw fail("A 1Password credential policy contains unsupported fields.", exitCode: 3)
+        }
+        placement = .onePasswordServiceAccount
+    case "api-key":
+        guard dictionary["header"] == nil,
+              dictionary["prefix"] == nil,
+              dictionary["username"] == nil else {
+            throw fail("An APIKey credential policy contains unsupported fields.", exitCode: 3)
+        }
+        placement = .apiKey
     case "bearer":
         guard dictionary["header"] == nil,
               dictionary["prefix"] == nil,
@@ -735,11 +776,22 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
     let credentials = try rawCredentials.map(parseCredential)
     let operations = try rawOperations.map(parseOperation)
 
+    if credentials.contains(where: { $0.placement.isOnePassword }) {
+        guard credentials.count == 1, proxy == nil,
+              isTrustedOnePasswordOrigin(origin),
+              operations.count == 1,
+              operations[0].methods == Set(["GET"]),
+              operations[0].body == .none, operations[0].response == .json,
+              case .exact("/user/me") = operations[0].path else {
+            throw fail("1Password profiles must permit only GET /user/me on a trusted account origin.", exitCode: 3)
+        }
+    }
+
     var headerNames = Set<String>()
     for credential in credentials {
         let headerName: String
         switch credential.placement {
-        case .bearer, .basic: headerName = "authorization"
+        case .bearer, .apiKey, .basic, .onePasswordServiceAccount: headerName = "authorization"
         case .header(let name, _): headerName = name.lowercased()
         }
         guard headerNames.insert(headerName).inserted else {
@@ -761,6 +813,108 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
         credentials: credentials,
         operations: operations
     )
+}
+
+
+// 1Password service accounts use SRP through the official CLI, never bearer auth.
+private func isTrustedOnePasswordOrigin(_ origin: URL) -> Bool {
+    guard origin.scheme == "https", origin.port == nil,
+          origin.user == nil, origin.password == nil,
+          origin.query == nil, origin.fragment == nil,
+          origin.path.isEmpty || origin.path == "/",
+          let host = origin.host?.lowercased(),
+          host.range(of: #"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.1password\.(com|eu|ca)$"#,
+                     options: .regularExpression) != nil else { return false }
+    return true
+}
+
+private func validateOnePasswordTokenOrigin(_ token: String, expected: URL) throws {
+    guard token.hasPrefix("ops_"), token.count <= 4096 else {
+        throw fail("The Keychain entry is not a supported 1Password service account token.", exitCode: 4)
+    }
+    var encoded = String(token.dropFirst(4))
+    guard encoded.range(of: #"^[A-Za-z0-9_-]+={0,2}$"#, options: .regularExpression) != nil else {
+        throw fail("The 1Password service account token has an invalid encoding.", exitCode: 4)
+    }
+    encoded = encoded.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/")
+    encoded += String(repeating: "=", count: (4 - encoded.count % 4) % 4)
+    guard let data = Data(base64Encoded: encoded),
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let address = object["signInAddress"] as? String,
+          let origin = URL(string: address.contains("://") ? address : "https://" + address),
+          isTrustedOnePasswordOrigin(origin), isTrustedOnePasswordOrigin(expected),
+          origin.host?.lowercased() == expected.host?.lowercased() else {
+        throw fail("The token sign-in destination does not match the approved 1Password origin.", exitCode: 4)
+    }
+}
+
+private func verifiedOnePasswordExecutable() throws -> URL {
+    let url = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".local/share/keychain-api/op")
+    let metadata = try openRegularFile(at: url.path, maximumBytes: 150 * 1024 * 1024, requirePrivateMode: true)
+    close(metadata.descriptor)
+    var code: SecStaticCode?
+    var requirement: SecRequirement?
+    let rule = #"anchor apple generic and certificate leaf[subject.OU] = "2BUA8C4S2C""#
+    guard SecStaticCodeCreateWithPath(url as CFURL, [], &code) == errSecSuccess,
+          let code,
+          SecRequirementCreateWithString(rule as CFString, [], &requirement) == errSecSuccess,
+          let requirement,
+          SecStaticCodeCheckValidity(code, SecCSFlags(rawValue: kSecCSStrictValidate), requirement) == errSecSuccess else {
+        throw fail("The 1Password CLI failed vendor signature verification.", exitCode: 3)
+    }
+    return url
+}
+
+private func onePasswordIdentity(profile: ProfilePolicy, token: String, executable: URL) throws -> [String: Any] {
+    try validateOnePasswordTokenOrigin(token, expected: profile.origin)
+    let files = FileManager.default
+    let directory = files.temporaryDirectory.appendingPathComponent("keychain-op-" + UUID().uuidString, isDirectory: true)
+    try files.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(at: directory) }
+    let process = Process()
+    process.executableURL = executable
+    process.arguments = ["--config", directory.path, "--cache=false", "user", "get", "--me", "--format=json", "--no-color"]
+    // No inherited proxy, debug, alternate account, session, or TLS override variables.
+    process.environment = [
+        "PATH": "/usr/bin:/bin", "HOME": files.homeDirectoryForCurrentUser.path,
+        "TMPDIR": directory.path, "OP_SERVICE_ACCOUNT_TOKEN": token,
+        "OP_BIOMETRIC_UNLOCK_ENABLED": "false", "OP_DEBUG": "false", "OP_CACHE": "false"
+    ]
+    process.standardInput = FileHandle.nullDevice
+    process.standardError = FileHandle.nullDevice
+    let output = Pipe()
+    process.standardOutput = output
+    try process.run()
+    defer {
+        if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
+    }
+    let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+    let hardTimeout = DispatchWorkItem { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
+    DispatchQueue.global().asyncAfter(deadline: .now() + 40, execute: timeout)
+    DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: hardTimeout)
+    defer { timeout.cancel(); hardTimeout.cancel() }
+    var data = Data()
+    while let chunk = try output.fileHandleForReading.read(upToCount: 16384), !chunk.isEmpty {
+        guard data.count + chunk.count <= maximumResponseBytes else {
+            kill(process.processIdentifier, SIGKILL)
+            process.waitUntilExit()
+            throw fail("The 1Password response exceeded the safe size limit.", exitCode: 5)
+        }
+        data.append(chunk)
+    }
+    process.waitUntilExit()
+    guard process.terminationReason == .exit, process.terminationStatus == 0 else {
+        throw fail("The 1Password identity request failed; raw CLI diagnostics were suppressed.", exitCode: 5)
+    }
+    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          object["type"] as? String == "SERVICE_ACCOUNT",
+          let state = object["state"] as? String,
+          Set(["ACTIVE", "SUSPENDED", "DELETED", "PENDING"]).contains(state) else {
+        throw fail("The 1Password identity response did not match the expected schema.", exitCode: 5)
+    }
+    return ["ok": true, "authenticated": true, "account_type": "SERVICE_ACCOUNT", "state": state,
+            "secret_output": false, "profile": profile.name]
 }
 
 private enum KeychainReader {
@@ -981,15 +1135,8 @@ private final class APITransport {
         request.setValue(profile.mediaType.rawValue, forHTTPHeaderField: "Accept")
 
         for (credential, secret) in zip(profile.credentials, secrets) {
-            switch credential.placement {
-            case .bearer:
-                request.setValue("Bearer \(secret)", forHTTPHeaderField: "Authorization")
-            case .basic(let username):
-                let encoded = Data((username + ":" + secret).utf8).base64EncodedString()
-                request.setValue("Basic \(encoded)", forHTTPHeaderField: "Authorization")
-            case .header(let name, let prefix):
-                request.setValue(prefix + secret, forHTTPHeaderField: name)
-            }
+            let header = try credential.placement.requestHeader(secret: secret)
+            request.setValue(header.value, forHTTPHeaderField: header.name)
         }
 
         guard !((method == "GET" || method == "HEAD") && body != nil) else {
@@ -1136,7 +1283,77 @@ private func operationForRequest(profile: ProfilePolicy, method: String, relativ
     return operation
 }
 
+
+private func runOnePasswordSelfTest() throws {
+    func refusal(_ action: () throws -> Void) throws {
+        do { try action() } catch is SafeFailure { return }
+        throw fail("Self-test failed: unsafe 1Password input accepted.")
+    }
+    let origin = URL(string: "https://team.1password.com")!
+    func fixture(_ address: String) throws -> String {
+        let bytes = try JSONSerialization.data(withJSONObject: ["signInAddress": address])
+        return "ops_" + bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+    }
+    try validateOnePasswordTokenOrigin(fixture("team.1password.com"), expected: origin)
+    for address in ["other.1password.com", "team.1password.com.evil.invalid", "http://team.1password.com",
+                    "team.1password.com:443", "team.1password.com/path", "user@team.1password.com",
+                    "team.1password.com?query=x", "team.1password.com#fragment"] {
+        try refusal { try validateOnePasswordTokenOrigin(fixture(address), expected: origin) }
+    }
+    try refusal { _ = try CredentialPlacement.onePasswordServiceAccount.requestHeader(secret: "INERT") }
+    let credential: [String: Any] = ["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]
+    let operation: [String: Any] = ["method": "GET", "path": "/user/me", "body": "none", "response": "json"]
+    var profile: [String: Any] = ["origin": origin.absoluteString, "credentials": [credential], "operations": [operation]]
+    guard try parseProfile(name: "test", dictionary: profile).isOnePassword else {
+        throw fail("Self-test failed: 1Password profile dispatch.")
+    }
+    for path in ["/vaults", "/user/me?extra=true", "/user/me/"] {
+        var invalid = operation; invalid["path"] = path; profile["operations"] = [invalid]
+        try refusal { _ = try parseProfile(name: "test", dictionary: profile) }
+    }
+    var mutation = operation; mutation["method"] = "POST"; profile["operations"] = [mutation]
+    try refusal { _ = try parseProfile(name: "test", dictionary: profile) }
+}
+
 private func runSelfTest() throws {
+    try runOnePasswordSelfTest()
+    let marker = "INERT_AUTH_SELF_TEST"
+    let authFixture: [String: Any] = [
+        "service": "inert.test", "account": "inert", "type": "api-key"
+    ]
+    let apiKey = try parseCredential(authFixture).placement.requestHeader(secret: marker)
+    let bearer = try CredentialPlacement.bearer.requestHeader(secret: marker)
+    let basic = try CredentialPlacement.basic(username: "inert").requestHeader(secret: marker)
+    let custom = try CredentialPlacement.header(name: "X-Test", prefix: "Test ").requestHeader(secret: marker)
+    guard apiKey.name == "Authorization", apiKey.value == "APIKey " + marker,
+          bearer.name == "Authorization", bearer.value == "Bearer " + marker,
+          basic.name == "Authorization", basic.value == "Basic " + Data(("inert:" + marker).utf8).base64EncodedString(),
+          custom.name == "X-Test", custom.value == "Test " + marker else {
+        throw fail("Self-test failed: credential header schemes.")
+    }
+    func requireAuthPolicyRefusal(_ action: () throws -> Void) throws {
+        do { try action() } catch is SafeFailure { return }
+        throw fail("Self-test failed: unsafe authentication policy accepted.")
+    }
+    try requireAuthPolicyRefusal {
+        var invalid = authFixture
+        invalid["prefix"] = "arbitrary "
+        _ = try parseCredential(invalid)
+    }
+    try requireAuthPolicyRefusal {
+        _ = try parseCredential([
+            "service": "inert.test", "account": "inert", "type": "header",
+            "header": "Authorization", "prefix": "arbitrary "
+        ])
+    }
+    try requireAuthPolicyRefusal {
+        _ = try parseProfile(name: "inert", dictionary: [
+            "origin": "https://example.invalid",
+            "credentials": [authFixture, ["service": "inert.test", "account": "inert", "type": "bearer"]],
+            "operations": [["method": "GET", "path": "/v1/check", "body": "none", "response": "json"]]
+        ])
+    }
     guard try parseJSONMediaType(nil) == .json,
           try parseJSONMediaType("application/json") == .json,
           try parseJSONMediaType("application/vnd.api+json") == .jsonAPI else {
@@ -1513,6 +1730,17 @@ private enum KeychainAPICLI {
 
                 guard options.secretOutputFile == nil || operation.response != .empty else {
                     throw fail("Secret output requires a JSON response policy.", exitCode: 2)
+                }
+                if profile.isOnePassword {
+                    guard options.secretOutputFile == nil else {
+                        throw fail("The 1Password identity route emits only a safe summary.", exitCode: 2)
+                    }
+                    // Verify the destination and vendor binary before retrieving a credential.
+                    let executable = try verifiedOnePasswordExecutable()
+                    let token = try KeychainReader.value(profile.credentials[0])
+                    let summary = try onePasswordIdentity(profile: profile, token: token, executable: executable)
+                    try emitJSON(summary, forbiddenSecrets: [token])
+                    return
                 }
                 let transport = try APITransport(proxy: profile.proxy)
                 let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
