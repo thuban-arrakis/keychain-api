@@ -7,6 +7,7 @@ import Network
 private let maximumPolicyBytes = 1 * 1024 * 1024
 private let maximumBodyBytes = 1 * 1024 * 1024
 private let maximumResponseBytes = 8 * 1024 * 1024
+private let maximumCredentialBytes = 4096
 
 private struct SafeFailure: Error {
     let message: String
@@ -54,6 +55,19 @@ private func objectContainsAnySecret(_ object: Any, secrets: [String]) -> Bool {
         }
     }
     return false
+}
+
+private func credentialArtifacts(_ secrets: [String]) -> [String] {
+    Array(Set(secrets + secrets.map { Data($0.utf8).base64EncodedString() }))
+}
+
+private func checkedJSON(_ data: Data, forbiddenSecrets: [String], exitCode: Int32) throws -> Any {
+    guard !dataContainsAnySecret(data, secrets: forbiddenSecrets),
+          let object = try? JSONSerialization.jsonObject(with: data),
+          !objectContainsAnySecret(object, secrets: forbiddenSecrets) else {
+        throw fail("JSON was invalid or contained authentication credential material.", exitCode: exitCode)
+    }
+    return object
 }
 
 private let redactedValue = "[REDACTED]"
@@ -215,16 +229,11 @@ private func emitJSON(_ object: Any, forbiddenSecrets: [String] = []) throws {
     FileHandle.standardOutput.write(Data("\n".utf8))
 }
 
-private struct FileMetadata {
-    let descriptor: Int32
-    let size: Int
-}
-
 private func openRegularFile(
     at path: String,
     maximumBytes: Int,
     requirePrivateMode: Bool
-) throws -> FileMetadata {
+) throws -> Int32 {
     var info = stat()
     let descriptor = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
     guard descriptor >= 0 else {
@@ -245,7 +254,24 @@ private func openRegularFile(
         close(descriptor)
         throw fail("The policy file must have mode 0600 or stricter.", exitCode: 3)
     }
-    return FileMetadata(descriptor: descriptor, size: Int(info.st_size))
+    return descriptor
+}
+
+private func readBoundedData(from handle: FileHandle, into data: inout Data, maximumBytes: Int, overflow: SafeFailure) throws {
+    do {
+        while let chunk = try handle.read(upToCount: min(16384, maximumBytes - data.count + 1)), !chunk.isEmpty {
+            let remaining = maximumBytes - data.count
+            guard chunk.count <= remaining else {
+                data.append(chunk.prefix(remaining))
+                throw overflow
+            }
+            data.append(chunk)
+        }
+    } catch let failure as SafeFailure {
+        throw failure
+    } catch {
+        throw fail("A data stream could not be read safely.", exitCode: overflow.exitCode)
+    }
 }
 
 private func readRegularFile(
@@ -253,15 +279,11 @@ private func readRegularFile(
     maximumBytes: Int,
     requirePrivateMode: Bool
 ) throws -> Data {
-    let metadata = try openRegularFile(
-        at: path,
-        maximumBytes: maximumBytes,
-        requirePrivateMode: requirePrivateMode
-    )
-    let handle = FileHandle(fileDescriptor: metadata.descriptor, closeOnDealloc: true)
-    guard let data = try? handle.readToEnd(), data.count <= maximumBytes else {
-        throw fail("A required local file could not be read safely.", exitCode: 3)
-    }
+    let descriptor = try openRegularFile(at: path, maximumBytes: maximumBytes, requirePrivateMode: requirePrivateMode)
+    let handle = FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+    var data = Data()
+    try readBoundedData(from: handle, into: &data, maximumBytes: maximumBytes,
+                        overflow: fail("A required local file exceeded the safe size limit.", exitCode: 3))
     return data
 }
 
@@ -436,9 +458,8 @@ private func forbiddenCredentialArtifacts(
     profile: ProfilePolicy,
     secrets: [String]
 ) -> [String] {
-    var artifacts = Set(secrets)
+    var artifacts = Set(credentialArtifacts(secrets))
     for (credential, secret) in zip(profile.credentials, secrets) {
-        artifacts.insert(Data(secret.utf8).base64EncodedString())
         if case .basic(let username) = credential.placement {
             artifacts.insert(Data((username + ":" + secret).utf8).base64EncodedString())
         }
@@ -450,6 +471,13 @@ private enum BodyPolicy: String {
     case none
     case json
     case optionalJSON = "optional-json"
+
+    func validate(method: String, hasBody: Bool) throws {
+        guard !hasBody || (self != .none && method != "GET" && method != "HEAD"),
+              hasBody || self != .json else {
+            throw fail("The request body does not match the selected policy operation.", exitCode: 2)
+        }
+    }
 }
 
 private enum ResponsePolicy: String {
@@ -526,18 +554,24 @@ private func parseSOCKSProxy(_ raw: Any?) throws -> SOCKSProxyPolicy? {
     return SOCKSProxyPolicy(port: UInt16(port))
 }
 
+private enum ProfileOperations {
+    case http([OperationPolicy])
+    case onePassword(Set<String>)
+
+    func permits(command: String) -> Bool {
+        guard case .onePassword(let commands) = self else { return false }
+        return commands.contains(command)
+    }
+}
+
 private struct ProfilePolicy {
     let name: String
     let origin: URL
     let mediaType: JSONMediaType
     let proxy: SOCKSProxyPolicy?
     let credentials: [CredentialPolicy]
-    let operations: [OperationPolicy]
-    let opCommands: Set<String>
+    let operations: ProfileOperations
 
-    var isOnePassword: Bool {
-        credentials.contains { $0.placement.isOnePassword }
-    }
 }
 
 private struct PolicyStore {
@@ -618,29 +652,16 @@ private func parseCredential(_ raw: Any) throws -> CredentialPolicy {
         throw fail("A policy profile contains an invalid credential reference.", exitCode: 3)
     }
 
+    if ["onepassword-service-account", "api-key", "bearer"].contains(type) {
+        guard dictionary["header"] == nil, dictionary["prefix"] == nil, dictionary["username"] == nil else {
+            throw fail("The credential policy contains unsupported fields for its authentication type.", exitCode: 3)
+        }
+    }
     let placement: CredentialPlacement
     switch type {
-    case "onepassword-service-account":
-        guard dictionary["header"] == nil,
-              dictionary["prefix"] == nil,
-              dictionary["username"] == nil else {
-            throw fail("A 1Password credential policy contains unsupported fields.", exitCode: 3)
-        }
-        placement = .onePasswordServiceAccount
-    case "api-key":
-        guard dictionary["header"] == nil,
-              dictionary["prefix"] == nil,
-              dictionary["username"] == nil else {
-            throw fail("An APIKey credential policy contains unsupported fields.", exitCode: 3)
-        }
-        placement = .apiKey
-    case "bearer":
-        guard dictionary["header"] == nil,
-              dictionary["prefix"] == nil,
-              dictionary["username"] == nil else {
-            throw fail("A bearer credential policy contains unsupported fields.", exitCode: 3)
-        }
-        placement = .bearer
+    case "onepassword-service-account": placement = .onePasswordServiceAccount
+    case "api-key": placement = .apiKey
+    case "bearer": placement = .bearer
     case "basic":
         guard dictionary["header"] == nil,
               dictionary["prefix"] == nil,
@@ -656,8 +677,8 @@ private func parseCredential(_ raw: Any) throws -> CredentialPolicy {
               validateHeaderName(header) else {
             throw fail("A header credential policy is invalid.", exitCode: 3)
         }
-        let prefix = dictionary["prefix"] as? String ?? ""
-        guard prefix.count <= 100, !containsControlCharacters(prefix) else {
+        guard let prefix = (dictionary["prefix"] ?? "") as? String,
+              prefix.count <= 100, !containsControlCharacters(prefix) else {
             throw fail("A credential header prefix is invalid.", exitCode: 3)
         }
         placement = .header(name: header, prefix: prefix)
@@ -759,11 +780,11 @@ private func parseOperation(_ raw: Any) throws -> OperationPolicy {
 }
 
 private func parseProfile(name: String, dictionary: [String: Any]) throws -> ProfilePolicy {
-    guard hasOnlyKeys(dictionary, allowed: ["origin", "media_type", "proxy", "credentials", "operations", "op_commands"]),
+    guard hasOnlyKeys(dictionary, allowed: ["origin", "media_type", "proxy", "credentials", "operations"]),
           let rawCredentials = dictionary["credentials"] as? [Any],
           (1...8).contains(rawCredentials.count),
           let rawOperations = dictionary["operations"] as? [Any],
-          rawOperations.count <= 50 else {
+          (1...128).contains(rawOperations.count) else {
         throw fail("A policy profile has an invalid shape.", exitCode: 3)
     }
     let origin = try parseOrigin(dictionary["origin"])
@@ -782,26 +803,26 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
         }
     }
     let credentials = try rawCredentials.map(parseCredential)
-    let operations = try rawOperations.map(parseOperation)
-    let rawCommands = dictionary["op_commands"] ?? [String]()
-    guard let commands = rawCommands as? [String], commands.count <= 128,
-          Set(commands).count == commands.count, commands.allSatisfy(isSafeOnePasswordCommand) else {
-        throw fail("The 1Password command allowlist is invalid.", exitCode: 3)
-    }
-
+    let operations: ProfileOperations
     if credentials.contains(where: { $0.placement.isOnePassword }) {
-        guard credentials.count == 1, proxy == nil,
-              isTrustedOnePasswordOrigin(origin),
-              !operations.isEmpty || !commands.isEmpty,
-              operations.allSatisfy({ operation in
-                  guard operation.methods == Set(["GET"]), operation.body == .none,
-                        operation.response == .json, case .exact("/user/me") = operation.path else { return false }
-                  return true
-              }) else {
-            throw fail("Invalid 1Password profile: use op_commands for CLI operations and GET /user/me only for the compatibility check.", exitCode: 3)
+        guard credentials.count == 1, proxy == nil, isTrustedOnePasswordOrigin(origin) else {
+            throw fail("A 1Password profile requires one credential, a trusted account origin, and no proxy.", exitCode: 3)
         }
-    } else if operations.isEmpty || dictionary["op_commands"] != nil {
-        throw fail("HTTP profiles require operations and cannot define CLI commands.", exitCode: 3)
+        var commands = Set<String>()
+        for raw in rawOperations {
+            guard let operation = raw as? [String: Any], hasOnlyKeys(operation, allowed: ["command"]),
+                  let command = operation["command"] as? String, isSafeOnePasswordCommand(command),
+                  commands.insert(command).inserted else {
+                throw fail("1Password operations must contain unique command entries.", exitCode: 3)
+            }
+        }
+        operations = .onePassword(commands)
+    } else {
+        let httpOperations = try rawOperations.map(parseOperation)
+        guard Set(httpOperations.map(\.uniqueKey)).count == httpOperations.count else {
+            throw fail("A policy profile defines an operation more than once.", exitCode: 3)
+        }
+        operations = .http(httpOperations)
     }
 
     var headerNames = Set<String>()
@@ -816,20 +837,13 @@ private func parseProfile(name: String, dictionary: [String: Any]) throws -> Pro
         }
     }
 
-    var operationKeys = Set<String>()
-    for operation in operations {
-        guard operationKeys.insert(operation.uniqueKey).inserted else {
-            throw fail("A policy profile defines an operation more than once.", exitCode: 3)
-        }
-    }
     return ProfilePolicy(
         name: name,
         origin: origin,
         mediaType: mediaType,
         proxy: proxy,
         credentials: credentials,
-        operations: operations,
-        opCommands: Set(commands)
+        operations: operations
     )
 }
 
@@ -860,9 +874,31 @@ private func readProtectedInput(at path: String, maximumBytes: Int) throws -> Da
           hasNoExtendedACL(fd) else {
         throw fail("Private input failed ownership, permissions, or size checks.", exitCode: 3)
     }
-    let data = try handle.read(upToCount: maximumBytes + 1) ?? Data()
-    guard data.count <= maximumBytes else { throw fail("Private input exceeded its size limit.", exitCode: 3) }
+    var data = Data()
+    try readBoundedData(from: handle, into: &data, maximumBytes: maximumBytes,
+                        overflow: fail("Private input exceeded its size limit.", exitCode: 3))
     return data
+}
+
+private func validateOnePasswordArgumentValue(_ value: String, command: String) throws {
+    guard isSafeMetadata(value, maximumLength: 4096),
+          !looksLikeCredentialValue(value), !value.hasPrefix("ops_") else {
+        throw fail("CLI arguments must contain only non-secret metadata.", exitCode: 2)
+    }
+    if value.hasPrefix("op://") {
+        guard command == "read", let url = URLComponents(string: value),
+              url.scheme == "op", url.user == nil, url.password == nil, url.fragment == nil,
+              url.queryItems?.allSatisfy({
+                  ($0.name == "attribute" && ["value", "type", "title", "id", "purpose", "otp"].contains($0.value ?? ""))
+                    || ($0.name == "ssh-format" && $0.value == "openssh")
+              }) ?? true else {
+            throw fail("Invalid secret reference or unsupported reference query.", exitCode: 2)
+        }
+    } else {
+        guard !value.hasPrefix("-"), !value.contains("="), !value.contains("://") else {
+            throw fail("Inline assignments, URLs, stdin, and short flags are refused; use a protected input file for secrets.", exitCode: 2)
+        }
+    }
 }
 
 private func validateOnePasswordArguments(_ arguments: [String], command: String) throws {
@@ -875,68 +911,98 @@ private func validateOnePasswordArguments(_ arguments: [String], command: String
         "--password", "--value", "--secret", "--token", "--url", "--notes", "--description"
     ]
     for argument in arguments {
-        guard isSafeMetadata(argument, maximumLength: 4096),
-              !looksLikeCredentialValue(argument), !argument.hasPrefix("ops_") else {
-            throw fail("CLI arguments must contain only non-secret metadata.", exitCode: 2)
+        guard isSafeMetadata(argument, maximumLength: 4096) else {
+            throw fail("CLI arguments must be nonempty metadata within the size limit.", exitCode: 2)
         }
         if argument.hasPrefix("--") {
-            guard argument.range(of: #"^--[a-z][a-z0-9-]*$"#, options: .regularExpression) != nil,
-                  !blocked.contains(argument), (!argument.contains("file") || argument == "--file-name"),
-                  !argument.contains("output"), !argument.contains("input"),
-                  !argument.contains("template") else {
-                throw fail("CLI control and file flags are managed by the helper; use split, non-secret options only.", exitCode: 2)
+            let parts = argument.split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false).map(String.init)
+            let flag = parts[0]
+            guard flag.range(of: #"^--[a-z][a-z0-9-]*$"#, options: .regularExpression) != nil,
+                  !blocked.contains(flag), (!flag.contains("file") || flag == "--file-name"),
+                  !flag.contains("output"), !flag.contains("input"), !flag.contains("template") else {
+                throw fail("CLI authentication, control, and file flags are managed by the helper.", exitCode: 2)
             }
-        } else if argument.hasPrefix("op://") {
-            guard command == "read", let url = URLComponents(string: argument),
-                  url.scheme == "op", url.user == nil, url.password == nil, url.fragment == nil,
-                  url.queryItems?.allSatisfy({
-                      ($0.name == "attribute" && ["value", "type", "title", "id", "purpose", "otp"].contains($0.value ?? ""))
-                        || ($0.name == "ssh-format" && $0.value == "openssh")
-                  }) ?? true else {
-                throw fail("Invalid secret reference or unsupported reference query.", exitCode: 2)
+            if parts.count == 2, !parts[1].isEmpty {
+                try validateOnePasswordArgumentValue(parts[1], command: command)
             }
         } else {
-            guard !argument.hasPrefix("-"), !argument.contains("="), !argument.contains("://") else {
-                throw fail("Inline assignments, URLs, stdin, and short flags are refused; use a protected input file for secrets.", exitCode: 2)
-            }
+            try validateOnePasswordArgumentValue(argument, command: command)
         }
     }
 }
 
-private func validateOnePasswordInput(_ input: Data?, command: String, arguments: [String]) throws {
-    if command == "document create" || command == "document edit" {
-        guard input != nil else { throw fail("Document uploads require --input-file.", exitCode: 2) }
-        let metadata = command == "document edit" ? Array(arguments.dropFirst()) : arguments
-        if command == "document edit" {
+private enum OnePasswordInput {
+    case template(Data)
+    case document(Data, argumentIndex: Int)
+
+    var data: Data {
+        switch self {
+        case .template(let data), .document(let data, _): return data
+        }
+    }
+
+    func arguments(_ arguments: [String], withPath path: String) -> [String] {
+        switch self {
+        case .template: return arguments + ["--template", path]
+        case .document(_, let index):
+            var result = arguments
+            result.insert(path, at: index)
+            return result
+        }
+    }
+}
+
+private func prepareOnePasswordInput(_ input: Data?, command: String, arguments: [String]) throws -> OnePasswordInput? {
+    switch command {
+    case "document create", "document edit":
+        guard let input else { throw fail("Document uploads require --input-file.", exitCode: 2) }
+        let index = command == "document edit" ? 1 : 0
+        if index == 1 {
             guard let item = arguments.first, !item.hasPrefix("-") else {
                 throw fail("Document edit requires an item identifier first.", exitCode: 2)
             }
         }
-        // Document upload options all take one metadata value. No additional local file paths.
-        guard metadata.count % 2 == 0 else { throw fail("Invalid document upload options.", exitCode: 2) }
-        for index in stride(from: 0, to: metadata.count, by: 2) {
-            guard ["--title", "--tags", "--vault", "--file-name"].contains(metadata[index]),
-                  !metadata[index + 1].hasPrefix("-") else {
+        let metadata = Array(arguments.dropFirst(index))
+        // Every document upload option takes one metadata value, in split or attached form.
+        var optionIndex = 0
+        while optionIndex < metadata.count {
+            let parts = metadata[optionIndex].split(separator: "=", maxSplits: 1, omittingEmptySubsequences: false)
+            guard let flag = parts.first, ["--title", "--tags", "--vault", "--file-name"].contains(String(flag)) else {
                 throw fail("Unsupported document upload option.", exitCode: 2)
             }
+            if parts.count == 1 {
+                guard optionIndex + 1 < metadata.count, !metadata[optionIndex + 1].hasPrefix("-") else {
+                    throw fail("Document upload options require a value.", exitCode: 2)
+                }
+                optionIndex += 1
+            }
+            optionIndex += 1
         }
-    } else if let input {
-        guard ["item create", "item edit"].contains(command),
-              input.count <= maximumBodyBytes,
+        return .document(input, argumentIndex: index)
+    case "item create", "item edit":
+        guard let input else { return nil }
+        guard input.count <= maximumBodyBytes,
               (try? JSONSerialization.jsonObject(with: input)) is [String: Any] else {
-            throw fail("Protected JSON templates are supported only for item create/edit.", exitCode: 2)
+            throw fail("Item templates must contain a JSON object within the size limit.", exitCode: 2)
         }
+        return .template(input)
+    default:
+        guard input == nil else { throw fail("This command does not accept a protected input file.", exitCode: 2) }
+        return nil
     }
 }
 
 private func onePasswordProtectedResponse(_ data: Data, command: String, token: String) throws -> Data {
-    guard !dataContainsAnySecret(data, secrets: [token, Data(token.utf8).base64EncodedString()]) else {
+    let artifacts = credentialArtifacts([token])
+    guard !dataContainsAnySecret(data, secrets: artifacts) else {
         throw fail("The CLI response echoed the authentication credential; output was refused.", exitCode: 5)
     }
     if data.isEmpty { return try encodedJSON(["ok": true]) }
-    if command != "read", command != "document get",
-       let object = try? JSONSerialization.jsonObject(with: data), JSONSerialization.isValidJSONObject(object) {
-        return data
+    if let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
+        guard !objectContainsAnySecret(object, secrets: artifacts) else {
+            throw fail("The CLI response echoed the authentication credential; output was refused.", exitCode: 5)
+        }
+        if command != "read", command != "document get", JSONSerialization.isValidJSONObject(object) { return data }
     }
     // Binary downloads and plaintext field values remain private inside a JSON envelope.
     return try encodedJSON(["encoding": "base64", "data": data.base64EncodedString()])
@@ -954,7 +1020,7 @@ private func isTrustedOnePasswordOrigin(_ origin: URL) -> Bool {
 }
 
 private func validateOnePasswordTokenOrigin(_ token: String, expected: URL) throws {
-    guard token.hasPrefix("ops_"), token.count <= 4096 else {
+    guard token.hasPrefix("ops_"), token.count <= maximumCredentialBytes else {
         throw fail("The Keychain entry is not a supported 1Password service account token.", exitCode: 4)
     }
     var encoded = String(token.dropFirst(4))
@@ -976,8 +1042,8 @@ private func validateOnePasswordTokenOrigin(_ token: String, expected: URL) thro
 private func verifiedOnePasswordExecutable() throws -> URL {
     let url = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent(".local/share/keychain-api/op")
-    let metadata = try openRegularFile(at: url.path, maximumBytes: 150 * 1024 * 1024, requirePrivateMode: true)
-    close(metadata.descriptor)
+    let descriptor = try openRegularFile(at: url.path, maximumBytes: 150 * 1024 * 1024, requirePrivateMode: true)
+    close(descriptor)
     var code: SecStaticCode?
     var requirement: SecRequirement?
     let rule = #"anchor apple generic and certificate leaf[subject.OU] = "2BUA8C4S2C""#
@@ -993,8 +1059,9 @@ private func verifiedOnePasswordExecutable() throws -> URL {
 
 private func runOnePasswordCommand(
     profile: ProfilePolicy, token: String, executable: URL,
-    command: String, arguments: [String], input: Data? = nil
-) throws -> Data {
+    command: String, arguments: [String], input: OnePasswordInput? = nil,
+    timeoutSeconds: TimeInterval = 40
+) throws -> OnePasswordResult {
     try validateOnePasswordTokenOrigin(token, expected: profile.origin)
     let files = FileManager.default
     let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true).appendingPathComponent("keychain-op-" + UUID().uuidString, isDirectory: true)
@@ -1008,17 +1075,9 @@ private func runOnePasswordCommand(
         let fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
         guard fd >= 0 else { throw fail("Private CLI input could not be created.", exitCode: 3) }
         let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-        try handle.write(contentsOf: input)
+        try handle.write(contentsOf: input.data)
         try handle.close()
-        if command == "item create" || command == "item edit" {
-            commandArguments += ["--template", path]
-        } else if command == "document create" {
-            commandArguments.insert(path, at: 0)
-        } else if command == "document edit", !commandArguments.isEmpty {
-            commandArguments.insert(path, at: 1)
-        } else {
-            throw fail("This command does not accept a protected input file.", exitCode: 2)
-        }
+        commandArguments = input.arguments(arguments, withPath: path)
     }
     process.arguments = ["--config", directory.path, "--cache=false", "--format=json", "--no-color"]
         + command.split(separator: " ").map(String.init) + commandArguments
@@ -1036,36 +1095,53 @@ private func runOnePasswordCommand(
     defer {
         if process.isRunning { kill(process.processIdentifier, SIGKILL); process.waitUntilExit() }
     }
-    let timeout = DispatchWorkItem { if process.isRunning { process.terminate() } }
+    let deadlineQueue = DispatchQueue(label: "keychain-api.onepassword-deadline")
+    let deadlineExpired = DispatchSemaphore(value: 0)
+    let timeout = DispatchWorkItem {
+        if process.isRunning { deadlineExpired.signal(); process.terminate() }
+    }
     let hardTimeout = DispatchWorkItem { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
-    DispatchQueue.global().asyncAfter(deadline: .now() + 40, execute: timeout)
-    DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: hardTimeout)
+    deadlineQueue.asyncAfter(deadline: .now() + timeoutSeconds, execute: timeout)
+    deadlineQueue.asyncAfter(deadline: .now() + timeoutSeconds + 5, execute: hardTimeout)
     defer { timeout.cancel(); hardTimeout.cancel() }
     var data = Data()
-    while let chunk = try output.fileHandleForReading.read(upToCount: 16384), !chunk.isEmpty {
-        guard data.count + chunk.count <= maximumResponseBytes else {
-            kill(process.processIdentifier, SIGKILL)
-            process.waitUntilExit()
-            throw fail("The 1Password response exceeded the safe size limit.", exitCode: 5)
-        }
-        data.append(chunk)
+    var failure: SafeFailure?
+    do {
+        try readBoundedData(from: output.fileHandleForReading, into: &data, maximumBytes: maximumResponseBytes,
+                            overflow: fail("The 1Password response exceeded the safe size limit.", exitCode: 5))
+    } catch {
+        failure = fail("The 1Password output could not be read completely. Check protected output and remote state before retrying.", exitCode: 5)
+        if process.isRunning { kill(process.processIdentifier, SIGKILL) }
     }
     process.waitUntilExit()
-    guard process.terminationReason == .exit, process.terminationStatus == 0 else {
-        throw fail("The 1Password command failed; raw diagnostics were suppressed. Check remote state before retrying a mutation.", exitCode: 5)
+    timeout.cancel()
+    hardTimeout.cancel()
+    // Drain any deadline callback already executing before classifying a graceful exit.
+    let timedOut = deadlineQueue.sync { deadlineExpired.wait(timeout: .now()) == .success }
+    if failure == nil && (timedOut || process.terminationReason != .exit || process.terminationStatus != 0) {
+        failure = fail("The 1Password command failed. Check protected output and remote state before retrying; raw diagnostics were suppressed.", exitCode: 5)
     }
-    return data
+    return OnePasswordResult(data: data, failure: failure)
 }
 
-private func onePasswordIdentitySummary(_ data: Data, profileName: String) throws -> [String: Any] {
-    guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-          object["type"] as? String == "SERVICE_ACCOUNT",
-          let state = object["state"] as? String,
-          Set(["ACTIVE", "SUSPENDED", "DELETED", "PENDING"]).contains(state) else {
-        throw fail("The 1Password identity response did not match the expected schema.", exitCode: 5)
+private struct OnePasswordResult {
+    let data: Data
+    let failure: SafeFailure?
+
+    func requireSuccess() throws -> Data {
+        if let failure { throw failure }
+        return data
     }
-    return ["ok": true, "authenticated": true, "account_type": "SERVICE_ACCOUNT", "state": state,
-            "secret_output": false, "profile": profileName]
+}
+
+private func saveOnePasswordResult(_ result: OnePasswordResult, command: String, token: String,
+                                   output: ProtectedResponseFile) throws -> [String: Any] {
+    if result.data.isEmpty, let failure = result.failure { throw failure }
+    let data = try onePasswordProtectedResponse(result.data, command: command, token: token)
+    let receipt = try output.commit(data)
+    // A failed command can still return a one-time value. Keep that recovery evidence private.
+    if let failure = result.failure { throw failure }
+    return receipt
 }
 
 private enum KeychainReader {
@@ -1111,33 +1187,7 @@ private enum KeychainReader {
         }
     }
 
-    static func value(_ credential: CredentialPolicy) throws -> String {
-        let query = try query(for: credential, returnData: true)
-        var result: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        switch status {
-        case errSecSuccess: break
-        case errSecItemNotFound:
-            throw fail("A credential required by this profile is not present in the login keychain.", exitCode: 4)
-        case errSecInteractionNotAllowed, errSecAuthFailed, errSecUserCanceled:
-            throw fail("Keychain access was not authorized or is unavailable.", exitCode: 4)
-        default:
-            throw fail("Keychain retrieval failed safely.", exitCode: 4)
-        }
-
-        guard var data = result as? Data, !data.isEmpty, data.count <= 4096 else {
-            throw fail("A Keychain item has no usable credential value.", exitCode: 4)
-        }
-        defer { data.resetBytes(in: 0..<data.count) }
-        guard let value = String(data: data, encoding: .utf8),
-              !value.isEmpty,
-              value.utf8.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
-            throw fail("A Keychain item is not a valid single-line credential.", exitCode: 4)
-        }
-        return value
-    }
-
-    static func authorize(_ credential: CredentialPolicy, context: LAContext) throws {
+    private static func readData(_ credential: CredentialPolicy, context: LAContext? = nil) throws -> Data {
         let query = try query(for: credential, returnData: true, context: context)
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
@@ -1148,22 +1198,33 @@ private enum KeychainReader {
         case errSecUserCanceled:
             throw fail("Keychain authorization was canceled.", exitCode: 4)
         case errSecInteractionNotAllowed, errSecAuthFailed:
-            throw fail("Keychain authorization was denied or is unavailable.", exitCode: 4)
+            throw fail("Keychain access was not authorized or is unavailable.", exitCode: 4)
         default:
-            throw fail("Keychain authorization failed safely.", exitCode: 4)
+            throw fail("Keychain retrieval failed safely.", exitCode: 4)
         }
-
         guard var data = result as? Data else {
             throw fail("A Keychain item has no usable credential value.", exitCode: 4)
         }
         result = nil
-        defer { data.resetBytes(in: 0..<data.count) }
-        guard !data.isEmpty,
-              data.count <= 4096,
+        guard !data.isEmpty, data.count <= maximumCredentialBytes,
               data.allSatisfy({ $0 >= 0x21 && $0 <= 0x7e }) else {
+            data.resetBytes(in: 0..<data.count)
             throw fail("A Keychain item is not a valid single-line credential.", exitCode: 4)
         }
+        return data
     }
+
+    static func value(_ credential: CredentialPolicy) throws -> String {
+        var data = try readData(credential)
+        defer { data.resetBytes(in: 0..<data.count) }
+        return String(decoding: data, as: UTF8.self)
+    }
+
+    static func authorize(_ credential: CredentialPolicy, context: LAContext) throws {
+        var data = try readData(credential, context: context)
+        data.resetBytes(in: 0..<data.count)
+    }
+
 }
 
 private final class RedirectBlocker: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
@@ -1290,21 +1351,12 @@ private final class APITransport {
             request.setValue(header.value, forHTTPHeaderField: header.name)
         }
 
-        guard !((method == "GET" || method == "HEAD") && body != nil) else {
-            throw fail("GET and HEAD requests cannot have a body.", exitCode: 2)
-        }
+        try operation.body.validate(method: method, hasBody: body != nil)
         let forbiddenArtifacts = forbiddenCredentialArtifacts(profile: profile, secrets: secrets)
-        switch (operation.body, body) {
-        case (.none, nil), (.optionalJSON, nil):
-            break
-        case (.json, .some(let body)), (.optionalJSON, .some(let body)):
-            guard !dataContainsAnySecret(body, secrets: forbiddenArtifacts) else {
-                throw fail("Refused a request body containing credential material.", exitCode: 2)
-            }
+        if let body {
+            _ = try checkedJSON(body, forbiddenSecrets: forbiddenArtifacts, exitCode: 2)
             request.httpBody = body
             request.setValue(profile.mediaType.rawValue, forHTTPHeaderField: "Content-Type")
-        default:
-            throw fail("The request body does not match the selected policy operation.", exitCode: 2)
         }
 
         let bytes: URLSession.AsyncBytes
@@ -1360,13 +1412,7 @@ private final class APITransport {
               mediaType == "application/json" || mediaType.hasSuffix("+json") else {
             throw fail("The API returned an unexpected response type.", exitCode: 5)
         }
-        guard !dataContainsAnySecret(data, secrets: forbiddenArtifacts),
-              let object = try? JSONSerialization.jsonObject(with: data) else {
-            throw fail("The API response was unsafe or was not valid JSON.", exitCode: 5)
-        }
-        guard !objectContainsAnySecret(object, secrets: forbiddenArtifacts) else {
-            throw fail("The API response contained credential material.", exitCode: 5)
-        }
+        let object = try checkedJSON(data, forbiddenSecrets: forbiddenArtifacts, exitCode: 5)
         if let secretOutput {
             return try secretOutput.commit(data)
         }
@@ -1430,7 +1476,10 @@ private func operationForRequest(profile: ProfilePolicy, method: String, relativ
           safeRelativeComponents(relativePath) != nil else {
         throw fail("The request method or path is invalid.", exitCode: 2)
     }
-    guard let operation = profile.operations.first(where: {
+    guard case .http(let operations) = profile.operations else {
+        throw fail("HTTP requests require an HTTP profile; use op for 1Password commands.", exitCode: 2)
+    }
+    guard let operation = operations.first(where: {
         $0.permits(method: method, relativePath: relativePath)
     }) else {
         throw fail("The requested method and path are not allowed by policy.", exitCode: 2)
@@ -1439,11 +1488,17 @@ private func operationForRequest(profile: ProfilePolicy, method: String, relativ
 }
 
 
-private func runOnePasswordSelfTest() throws {
-    func refusal(_ action: () throws -> Void) throws {
-        do { try action() } catch is SafeFailure { return }
-        throw fail("Self-test failed: unsafe 1Password input accepted.")
+private func expectFailure(_ label: String, exitCode: Int32? = nil, _ action: () throws -> Void) throws {
+    do { try action() } catch let error as SafeFailure {
+        guard exitCode == nil || error.exitCode == exitCode else {
+            throw fail("Self-test failed: unexpected exit code for " + label + ".")
+        }
+        return
     }
+    throw fail("Self-test failed: expected refusal for " + label + ".")
+}
+
+private func runOnePasswordSelfTest() throws {
     let origin = URL(string: "https://team.1password.com")!
     func fixture(_ address: String) throws -> String {
         let bytes = try JSONSerialization.data(withJSONObject: ["signInAddress": address])
@@ -1454,52 +1509,65 @@ private func runOnePasswordSelfTest() throws {
     for address in ["other.1password.com", "team.1password.com.evil.invalid", "http://team.1password.com",
                     "team.1password.com:443", "team.1password.com/path", "user@team.1password.com",
                     "team.1password.com?query=x", "team.1password.com#fragment"] {
-        try refusal { try validateOnePasswordTokenOrigin(fixture(address), expected: origin) }
+        try expectFailure("1Password input") { try validateOnePasswordTokenOrigin(fixture(address), expected: origin) }
     }
-    try refusal { _ = try CredentialPlacement.onePasswordServiceAccount.requestHeader(secret: "INERT") }
+    try expectFailure("1Password input") { _ = try CredentialPlacement.onePasswordServiceAccount.requestHeader(secret: "INERT") }
     let credential: [String: Any] = ["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]
-    let operation: [String: Any] = ["method": "GET", "path": "/user/me", "body": "none", "response": "json"]
-    var profile: [String: Any] = ["origin": origin.absoluteString, "credentials": [credential], "operations": [operation]]
-    guard try parseProfile(name: "test", dictionary: profile).isOnePassword else {
-        throw fail("Self-test failed: 1Password profile dispatch.")
-    }
-    for path in ["/vaults", "/user/me?extra=true", "/user/me/"] {
-        var invalid = operation; invalid["path"] = path; profile["operations"] = [invalid]
-        try refusal { _ = try parseProfile(name: "test", dictionary: profile) }
-    }
-    var mutation = operation; mutation["method"] = "POST"; profile["operations"] = [mutation]
-    try refusal { _ = try parseProfile(name: "test", dictionary: profile) }
-
-    profile["operations"] = []
-    profile["op_commands"] = ["vault list", "item create", "document get", "vault group grant", "read"]
+    let commands = ["whoami", "vault list", "item create", "document get", "vault group grant", "read"]
+    let profile: [String: Any] = ["origin": origin.absoluteString, "credentials": [credential],
+                                  "operations": commands.map { ["command": $0] }]
     let cliProfile = try parseProfile(name: "test", dictionary: profile)
-    guard cliProfile.opCommands.contains("item create"), !cliProfile.opCommands.contains("item delete") else {
-        throw fail("Self-test failed: native CLI command allowlist.")
+    guard cliProfile.operations.permits(command: "item create"), !cliProfile.operations.permits(command: "item delete") else {
+        throw fail("Self-test failed: native CLI operation allowlist.")
     }
     for command in ["run", "inject", "signin", "update", "plugin run", "vault", "item template", "item get --debug"] {
-        var invalid = profile; invalid["op_commands"] = [command]
-        try refusal { _ = try parseProfile(name: "test", dictionary: invalid) }
+        var invalid = profile; invalid["operations"] = [["command": command]]
+        try expectFailure("unsupported CLI operation", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: invalid) }
+    }
+    let httpOperation: [String: Any] = ["method": "GET", "path": "/v1/status", "body": "none", "response": "json"]
+    for operations: [Any] in [[], [["command": "whoami"], ["command": "whoami"]], [httpOperation],
+                              [["command": "whoami", "method": "GET"]], [["command": "whoami"], httpOperation]] {
+        var invalid = profile; invalid["operations"] = operations
+        try expectFailure("invalid or mixed CLI operations", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: invalid) }
+    }
+    var obsolete = profile; obsolete["op_commands"] = commands
+    try expectFailure("obsolete parallel command policy", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: obsolete) }
+    var httpProfile = profile
+    httpProfile["credentials"] = [["service": "inert.test", "account": "inert", "type": "bearer"]]
+    try expectFailure("CLI operations on HTTP profile", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: httpProfile) }
+    try expectFailure("HTTP dispatch on CLI profile", exitCode: 2) {
+        _ = try operationForRequest(profile: cliProfile, method: "GET", relativePath: "/v1/status")
     }
     try validateOnePasswordArguments(["item-id", "--vault", "vault-id", "--reveal"], command: "item get")
+    try validateOnePasswordArguments(["--generate-password=letters,digits,32", "--favorite=false"], command: "item create")
     try validateOnePasswordArguments(["op://vault/item/field?attribute=otp"], command: "read")
     for arguments in [["--session", "INERT"], ["--debug"], ["--config=/tmp"], ["-o", "output"],
                       ["--out-file", "output"], ["--template", "input"], ["field=INERT"], ["-"],
-                      ["--value", "INERT"], ["https://example.invalid"], ["--", "--debug"]] {
-        try refusal { try validateOnePasswordArguments(arguments, command: "item get") }
+                      ["--value", "INERT"], ["--session=INERT"], ["--template=input"],
+                      ["--value=INERT"], ["https://example.invalid"], ["--", "--debug"]] {
+        try expectFailure("1Password input") { try validateOnePasswordArguments(arguments, command: "item get") }
     }
-    try validateOnePasswordInput(Data("{}".utf8), command: "item create", arguments: [])
-    try validateOnePasswordInput(Data(), command: "document create", arguments: ["--vault", "vault-id"])
-    try refusal { try validateOnePasswordInput(nil, command: "document create", arguments: ["/private/file"]) }
-    try refusal { try validateOnePasswordInput(Data(), command: "document edit", arguments: []) }
-    try refusal { try validateOnePasswordInput(Data("[]".utf8), command: "item create", arguments: []) }
-    try refusal { try validateOnePasswordInput(Data("{}".utf8), command: "item list", arguments: []) }
+    _ = try prepareOnePasswordInput(Data("{}".utf8), command: "item create", arguments: [])
+    _ = try prepareOnePasswordInput(Data(), command: "document create", arguments: ["--vault", "vault-id"])
+    _ = try prepareOnePasswordInput(Data(), command: "document create", arguments: ["--vault=vault-id", "--tags="])
+    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(nil, command: "document create", arguments: ["/private/file"]) }
+    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data(), command: "document edit", arguments: []) }
+    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data("[]".utf8), command: "item create", arguments: []) }
+    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data("{}".utf8), command: "item list", arguments: []) }
     let fixtureBytes = Data([0, 255, 10])
     let envelope = try onePasswordProtectedResponse(fixtureBytes, command: "document get", token: "INERT_AUTH")
     guard let object = try JSONSerialization.jsonObject(with: envelope) as? [String: String],
           object["encoding"] == "base64", Data(base64Encoded: object["data"] ?? "") == fixtureBytes else {
         throw fail("Self-test failed: binary response preservation.")
     }
-    try refusal { _ = try onePasswordProtectedResponse(Data("INERT_AUTH".utf8), command: "read", token: "INERT_AUTH") }
+    try expectFailure("1Password input") { _ = try onePasswordProtectedResponse(Data("INERT_AUTH".utf8), command: "read", token: "INERT_AUTH") }
+    for encoded in [#"{"value":"INERT_\u0041UTH"}"#, #""INERT_\u0041UTH""#] {
+        for command in ["item get", "read"] {
+            try expectFailure("escaped CLI credential echo", exitCode: 5) {
+                _ = try onePasswordProtectedResponse(Data(encoded.utf8), command: command, token: "INERT_AUTH")
+            }
+        }
+    }
 
     let files = FileManager.default
     let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
@@ -1512,19 +1580,74 @@ private func runOnePasswordSelfTest() throws {
         throw fail("Self-test failed: private input read.")
     }
     try files.createSymbolicLink(atPath: directory.appendingPathComponent("link").path, withDestinationPath: inputPath)
-    try refusal { _ = try readProtectedInput(at: directory.appendingPathComponent("link").path, maximumBytes: 1024) }
+    try expectFailure("1Password input") { _ = try readProtectedInput(at: directory.appendingPathComponent("link").path, maximumBytes: 1024) }
     guard chmod(inputPath, 0o644) == 0 else { throw fail("Self-test fixture setup failed.") }
-    try refusal { _ = try readProtectedInput(at: inputPath, maximumBytes: 1024) }
+    try expectFailure("1Password input") { _ = try readProtectedInput(at: inputPath, maximumBytes: 1024) }
 
     // Exercise subprocess launch/collection with an inert local executable, not a real account.
     let executable = directory.appendingPathComponent("fixture")
-    try Data("#!/bin/sh\nprintf '{\"type\":\"SERVICE_ACCOUNT\",\"state\":\"ACTIVE\"}\\n'\n".utf8).write(to: executable)
+    let template = Data(#"{"title":"INERT_PRIVATE_INPUT"}"#.utf8)
+    let expectedInput = directory.appendingPathComponent("expected-input")
+    try template.write(to: expectedInput)
+    let script = """
+    #!/bin/sh
+    [ "$1" = '--config' ] || exit 20
+    [ "$OP_DEBUG:$OP_CACHE:$OP_BIOMETRIC_UNLOCK_ENABLED" = 'false:false:false' ] || exit 21
+    [ -z "${OP_CONNECT_HOST+x}${OP_CONNECT_TOKEN+x}${OP_SESSION+x}${HTTPS_PROXY+x}" ] || exit 22
+    [ "$(/usr/bin/stat -f %Lp "$2")" = '700' ] || exit 23
+    case "$*" in *INERT_PRIVATE_INPUT*) exit 24;; esac
+    case "$6 $7" in
+      'item create') [ "$8" = '--template' ] && [ "$9" = "$2/input" ] || exit 25;;
+      'document create') [ "$8" = "$2/input" ] || exit 25;;
+      'document edit') [ "$8" = 'item-id' ] && [ "$9" = "$2/input" ] || exit 25;;
+      'user get') ;;
+      *) exit 25;;
+    esac
+    if [ "$6" != 'user' ]; then
+      [ -f "$2/input" ] || exit 26
+      [ "$(/usr/bin/stat -f %Lp "$2/input")" = '600' ] || exit 25
+      /usr/bin/cmp -s "$2/input" '\(expectedInput.path)' || exit 26
+    fi
+    printf '{"type":"SERVICE_ACCOUNT","state":"ACTIVE","temporary_path":"%s"}\\n' "$2"
+    """
+    try Data(script.utf8).write(to: executable)
     guard chmod(executable.path, 0o700) == 0 else { throw fail("Self-test fixture setup failed.") }
     let output = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
                                           executable: executable, command: "user get", arguments: ["--me"])
-    guard try onePasswordIdentitySummary(output, profileName: "test")["authenticated"] as? Bool == true else {
+    guard let identity = try JSONSerialization.jsonObject(with: output.requireSuccess()) as? [String: Any],
+          identity["type"] as? String == "SERVICE_ACCOUNT" else {
         throw fail("Self-test failed: CLI process lifecycle.")
     }
+    for (command, arguments) in [("item create", [String]()), ("document create", []), ("document edit", ["item-id"])] {
+        let input = try prepareOnePasswordInput(template, command: command, arguments: arguments)
+        let result = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
+                                              executable: executable, command: command, arguments: arguments, input: input)
+        guard let object = try JSONSerialization.jsonObject(with: result.requireSuccess()) as? [String: Any],
+              let temporaryPath = object["temporary_path"] as? String,
+              !files.fileExists(atPath: temporaryPath) else {
+            throw fail("Self-test failed: private CLI input delivery or cleanup.")
+        }
+    }
+    try Data((script + "\nprintf INERT_STDERR >&2\nexit 7\n").utf8).write(to: executable)
+    let failed = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
+                                          executable: executable, command: "item create", arguments: [], input: .template(template))
+    let recoveryPath = directory.appendingPathComponent("failed-response.json").path
+    try expectFailure("failed CLI output recovery", exitCode: 5) {
+        _ = try saveOnePasswordResult(failed, command: "item create", token: "INERT_AUTH",
+                                     output: ProtectedResponseFile(path: recoveryPath))
+    }
+    guard failed.failure != nil, failed.data.range(of: Data("INERT_STDERR".utf8)) == nil,
+          try readProtectedInput(at: recoveryPath, maximumBytes: 4096) == failed.data,
+          let failedObject = try JSONSerialization.jsonObject(with: failed.data) as? [String: Any],
+          let failedTemporaryPath = failedObject["temporary_path"] as? String,
+          !files.fileExists(atPath: failedTemporaryPath) else {
+        throw fail("Self-test failed: failed CLI output was lost or temporary data was retained.")
+    }
+    try Data((script + "\ntrap 'exit 0' TERM\nwhile :; do :; done\n").utf8).write(to: executable)
+    let expired = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
+                                           executable: executable, command: "user get", arguments: ["--me"], timeoutSeconds: 1)
+    try expectFailure("deadline despite graceful subprocess exit", exitCode: 5) { _ = try expired.requireSuccess() }
+    guard !expired.data.isEmpty else { throw fail("Self-test failed: timeout response capture.") }
 }
 
 private func runSelfTest() throws {
@@ -1543,53 +1666,48 @@ private func runSelfTest() throws {
           custom.name == "X-Test", custom.value == "Test " + marker else {
         throw fail("Self-test failed: credential header schemes.")
     }
-    func requireAuthPolicyRefusal(_ action: () throws -> Void) throws {
-        do { try action() } catch is SafeFailure { return }
-        throw fail("Self-test failed: unsafe authentication policy accepted.")
-    }
-    try requireAuthPolicyRefusal {
+    try expectFailure("credential policy", exitCode: 3) {
         var invalid = authFixture
         invalid["prefix"] = "arbitrary "
         _ = try parseCredential(invalid)
     }
-    try requireAuthPolicyRefusal {
+    try expectFailure("credential policy", exitCode: 3) {
         _ = try parseCredential([
             "service": "inert.test", "account": "inert", "type": "header",
             "header": "Authorization", "prefix": "arbitrary "
         ])
     }
-    try requireAuthPolicyRefusal {
+    try expectFailure("credential policy", exitCode: 3) {
         _ = try parseProfile(name: "inert", dictionary: [
             "origin": "https://example.invalid",
             "credentials": [authFixture, ["service": "inert.test", "account": "inert", "type": "bearer"]],
             "operations": [["method": "GET", "path": "/v1/check", "body": "none", "response": "json"]]
         ])
     }
+    for prefix: Any in [true, 1, ["value": "INERT"]] {
+        try expectFailure("malformed header prefix", exitCode: 3) {
+            _ = try parseCredential(["service": "inert.test", "account": "inert", "type": "header",
+                                     "header": "X-Test", "prefix": prefix])
+        }
+    }
+    for policy in [BodyPolicy.none, .json, .optionalJSON] {
+        try expectFailure("GET body refusal", exitCode: 2) { try policy.validate(method: "GET", hasBody: true) }
+    }
+    try expectFailure("required JSON body", exitCode: 2) { try BodyPolicy.json.validate(method: "POST", hasBody: false) }
+    try expectFailure("forbidden body", exitCode: 2) { try BodyPolicy.none.validate(method: "POST", hasBody: true) }
+    try BodyPolicy.json.validate(method: "POST", hasBody: true)
+    try BodyPolicy.optionalJSON.validate(method: "GET", hasBody: false)
     guard try parseJSONMediaType(nil) == .json,
           try parseJSONMediaType("application/json") == .json,
           try parseJSONMediaType("application/vnd.api+json") == .jsonAPI else {
         throw fail("Self-test failed: JSON media-type policy.")
     }
-    var invalidMediaTypeRejected = false
-    do {
+    try expectFailure("JSON media-type restriction") {
         _ = try parseJSONMediaType("application/json\r\nX-Unsafe: value")
-    } catch is SafeFailure {
-        invalidMediaTypeRejected = true
-    }
-    guard invalidMediaTypeRejected else {
-        throw fail("Self-test failed: JSON media-type restriction.")
     }
 
     guard try parseSOCKSProxy(nil) == nil else {
         throw fail("Self-test failed: absent proxy policy.")
-    }
-    func requireProxyPolicyRefusal(_ action: () throws -> Void) throws {
-        do {
-            try action()
-        } catch let failure as SafeFailure where failure.exitCode == 3 {
-            return
-        }
-        throw fail("Self-test failed: unsafe proxy policy accepted.")
     }
     let proxyFixture: [String: Any] = ["type": "socks5", "host": "127.0.0.1", "port": 49153]
     let profileFixture: [String: Any] = [
@@ -1614,7 +1732,7 @@ private func runSelfTest() throws {
         ["type": "socks5", "host": "127.0.0.1", "port": 49153, "password": "INERT"],
         ["type": "socks5", "host": "127.0.0.1", "port": 49153, "allow_failover": true]
     ] {
-        try requireProxyPolicyRefusal { _ = try parseSOCKSProxy(invalid) }
+        try expectFailure("proxy policy", exitCode: 3) { _ = try parseSOCKSProxy(invalid) }
     }
     if #available(macOS 14.0, *) {
         guard let proxy = try parseSOCKSProxy(proxyFixture), proxy.port == 49153 else {
@@ -1631,7 +1749,7 @@ private func runSelfTest() throws {
             "https://192.0.2.1", "https://0x7f.0.0.1", "https://0x7f.0x0.0x0.0x1",
             "https://api.example.invalid.", "https://api..example.invalid"
         ] {
-            try requireProxyPolicyRefusal {
+            try expectFailure("proxy policy", exitCode: 3) {
                 var invalid = proxiedProfile
                 invalid["origin"] = origin
                 _ = try parseProfile(name: "fixture", dictionary: invalid)
@@ -1651,8 +1769,8 @@ private func runSelfTest() throws {
             throw fail("Self-test failed: unconfigured profile transport changed.")
         }
     } else {
-        try requireProxyPolicyRefusal { _ = try parseSOCKSProxy(proxyFixture) }
-        try requireProxyPolicyRefusal {
+        try expectFailure("proxy policy", exitCode: 3) { _ = try parseSOCKSProxy(proxyFixture) }
+        try expectFailure("proxy policy", exitCode: 3) {
             _ = try APITransport.sessionConfiguration(proxy: SOCKSProxyPolicy(port: 49153))
         }
     }
@@ -1683,59 +1801,35 @@ private func runSelfTest() throws {
     guard allowed.absoluteString == "https://example.invalid/v1/status?limit=1" else {
         throw fail("Self-test failed: URL construction.")
     }
-    var alternateOriginRejected = false
-    do {
+    try expectFailure("origin restriction") {
         _ = try APITransport.requestURL(
             origin: origin,
             relativePath: "//attacker.invalid/v1/status",
             method: "GET",
             operation: prefixOperation
         )
-    } catch is SafeFailure {
-        alternateOriginRejected = true
-    }
-    guard alternateOriginRejected else {
-        throw fail("Self-test failed: origin restriction.")
     }
 
-    var encodedTraversalRejected = false
-    do {
+    try expectFailure("encoded traversal restriction") {
         _ = try APITransport.requestURL(
             origin: origin,
             relativePath: "/v1/%2e%2e/admin",
             method: "GET",
             operation: prefixOperation
         )
-    } catch is SafeFailure {
-        encodedTraversalRejected = true
     }
-    guard encodedTraversalRejected else {
-        throw fail("Self-test failed: encoded traversal restriction.")
-    }
-    var prefixConfusionRejected = false
-    do {
+    try expectFailure("path-prefix boundary") {
         _ = try APITransport.requestURL(
             origin: origin,
             relativePath: "/v10/status",
             method: "GET",
             operation: prefixOperation
         )
-    } catch is SafeFailure {
-        prefixConfusionRejected = true
-    }
-    guard prefixConfusionRejected else {
-        throw fail("Self-test failed: path-prefix boundary.")
     }
 
     let inertMarker = "INERT_SELF_TEST_MARKER"
-    var outputTripwirePassed = false
-    do {
+    try expectFailure("output tripwire") {
         _ = try encodedJSON(["value": inertMarker], forbiddenSecrets: [inertMarker])
-    } catch is SafeFailure {
-        outputTripwirePassed = true
-    }
-    guard outputTripwirePassed else {
-        throw fail("Self-test failed: output tripwire.")
     }
     let redactionFixture: [String: Any] = [
         "default_password": "INERT_PASSWORD_VALUE",
@@ -1787,6 +1881,11 @@ private func runSelfTest() throws {
           objectContainsAnySecret(escapedObject, secrets: [escapedMarker]) else {
         throw fail("Self-test failed: parsed-object credential tripwire.")
     }
+    for exitCode: Int32 in [2, 5] {
+        try expectFailure("escaped JSON credential echo", exitCode: exitCode) {
+            _ = try checkedJSON(escapedData, forbiddenSecrets: [escapedMarker], exitCode: exitCode)
+        }
+    }
     try runProtectedResponseFileSelfTest()
     try emitJSON([
         "keychain_read": false,
@@ -1811,25 +1910,44 @@ private func runProtectedResponseFileSelfTest() throws {
           try encodedJSON(receipt).range(of: Data(marker.utf8)) == nil else {
         throw fail("Self-test failed: protected file bytes or receipt.")
     }
-    func requireRefusal(_ action: () throws -> Void) throws {
-        do { try action() } catch is SafeFailure { return }
-        throw fail("Self-test failed: unsafe secret file was accepted.")
-    }
-    try requireRefusal { _ = try ProtectedResponseFile(path: path) }
-    try requireRefusal { _ = try sink.commit(bytes) }
-    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/../unsafe.json") }
-    try requireRefusal { _ = try ProtectedResponseFile(path: "relative.json") }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: path) }
+    try expectFailure("protected file", exitCode: nil) { _ = try sink.commit(bytes) }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: directory + "/../unsafe.json") }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: "relative.json") }
     try files.createSymbolicLink(atPath: directory + "/link.json", withDestinationPath: path)
-    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/link.json") }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: directory + "/link.json") }
     try files.createSymbolicLink(atPath: directory + "/linked-directory", withDestinationPath: directory)
-    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/linked-directory/new.json") }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: directory + "/linked-directory/new.json") }
     let publicDirectory = directory + "/not-private"
     try files.createDirectory(atPath: publicDirectory, withIntermediateDirectories: false,
                               attributes: [.posixPermissions: 0o755])
     guard chmod(publicDirectory, 0o755) == 0 else { throw fail("Self-test fixture setup failed.") }
-    try requireRefusal { _ = try ProtectedResponseFile(path: publicDirectory + "/new.json") }
+    try expectFailure("protected file", exitCode: nil) { _ = try ProtectedResponseFile(path: publicDirectory + "/new.json") }
     guard try readRegularFile(at: path, maximumBytes: 4096, requirePrivateMode: true) == bytes else {
         throw fail("Self-test failed: existing secret file was modified.")
+    }
+    let inputPath = directory + "/bounded-input"
+    let input = Data(repeating: 0x61, count: 32769)
+    try input.write(to: URL(fileURLWithPath: inputPath))
+    for limit in [input.count, input.count - 1] {
+        let handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: inputPath))
+        defer { try? handle.close() }
+        var data = Data()
+        if limit == input.count {
+            try readBoundedData(from: handle, into: &data, maximumBytes: limit, overflow: fail("INERT_SIZE_LIMIT", exitCode: 3))
+            guard data == input else { throw fail("Self-test failed: bounded reader truncated input.") }
+        } else {
+            try expectFailure("bounded read limit", exitCode: 3) {
+                try readBoundedData(from: handle, into: &data, maximumBytes: limit, overflow: fail("INERT_SIZE_LIMIT", exitCode: 3))
+            }
+            guard data == input.prefix(limit) else { throw fail("Self-test failed: bounded partial capture.") }
+        }
+    }
+    let closedHandle = try FileHandle(forReadingFrom: URL(fileURLWithPath: inputPath))
+    try closedHandle.close()
+    var unread = Data()
+    try expectFailure("bounded read I/O error", exitCode: 3) {
+        try readBoundedData(from: closedHandle, into: &unread, maximumBytes: 10, overflow: fail("INERT_SIZE_LIMIT", exitCode: 3))
     }
 }
 
@@ -1916,13 +2034,13 @@ private enum KeychainAPICLI {
             case "op":
                 guard arguments.count >= 6 else { throw fail("op arguments are incomplete.", exitCode: 2) }
                 let store = try PolicyStore.load()
-                guard let profile = store.profiles[arguments[1]], profile.isOnePassword else {
+                guard let profile = store.profiles[arguments[1]], case .onePassword = profile.operations else {
                     throw fail("op requires a 1Password service-account profile.", exitCode: 2)
                 }
                 let options = try parseOptionPairs(Array(arguments.dropFirst(2)), allowed: [
                     "--command", "--args-file", "--input-file", "--secret-output-file"
                 ])
-                guard let command = options["--command"], profile.opCommands.contains(command),
+                guard let command = options["--command"], profile.operations.permits(command: command),
                       let outputPath = options["--secret-output-file"] else {
                     throw fail("op requires a policy-allowed command and a new protected output file.", exitCode: 2)
                 }
@@ -1935,14 +2053,13 @@ private enum KeychainAPICLI {
                 } ?? []
                 try validateOnePasswordArguments(rawArguments, command: command)
                 let input = try options["--input-file"].map { try readProtectedInput(at: $0, maximumBytes: maximumResponseBytes) }
-                try validateOnePasswordInput(input, command: command, arguments: rawArguments)
+                let preparedInput = try prepareOnePasswordInput(input, command: command, arguments: rawArguments)
                 let secretOutput = try ProtectedResponseFile(path: outputPath)
                 let executable = try verifiedOnePasswordExecutable()
                 let token = try KeychainReader.value(profile.credentials[0])
-                let data = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
-                                                    command: command, arguments: rawArguments, input: input)
-                let protectedData = try onePasswordProtectedResponse(data, command: command, token: token)
-                try emitJSON(secretOutput.commit(protectedData))
+                let result = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
+                                                      command: command, arguments: rawArguments, input: preparedInput)
+                try emitJSON(saveOnePasswordResult(result, command: command, token: token, output: secretOutput))
 
             case "request":
                 guard arguments.count >= 6 else { throw fail("request arguments are incomplete.", exitCode: 2) }
@@ -1958,34 +2075,10 @@ private enum KeychainAPICLI {
                     relativePath: options.path
                 )
                 let body = try options.bodyFile.map(readJSONBody)
-                let bodyMatchesPolicy: Bool
-                switch operation.body {
-                case .none:
-                    bodyMatchesPolicy = body == nil
-                case .json:
-                    bodyMatchesPolicy = body != nil && options.method != "GET" && options.method != "HEAD"
-                case .optionalJSON:
-                    bodyMatchesPolicy = body == nil || (options.method != "GET" && options.method != "HEAD")
-                }
-                guard bodyMatchesPolicy else {
-                    throw fail("The request body does not match policy.", exitCode: 2)
-                }
+                try operation.body.validate(method: options.method, hasBody: body != nil)
 
                 guard options.secretOutputFile == nil || operation.response != .empty else {
                     throw fail("Secret output requires a JSON response policy.", exitCode: 2)
-                }
-                if profile.isOnePassword {
-                    guard options.secretOutputFile == nil else {
-                        throw fail("The 1Password identity route emits only a safe summary.", exitCode: 2)
-                    }
-                    // Verify the destination and vendor binary before retrieving a credential.
-                    let executable = try verifiedOnePasswordExecutable()
-                    let token = try KeychainReader.value(profile.credentials[0])
-                    let data = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
-                                                         command: "user get", arguments: ["--me"])
-                    let summary = try onePasswordIdentitySummary(data, profileName: profile.name)
-                    try emitJSON(summary, forbiddenSecrets: [token])
-                    return
                 }
                 let transport = try APITransport(proxy: profile.proxy)
                 let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
