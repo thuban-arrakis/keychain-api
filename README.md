@@ -18,7 +18,7 @@ Build an optimized executable with Swift Package Manager:
 
 ```sh
 swift build --configuration release
-swift run keychain-api self-test
+swift run --configuration release keychain-api self-test
 ```
 
 The resulting executable is under the directory printed by:
@@ -57,7 +57,7 @@ xcrun swiftc \
   -target arm64-apple-macosx12.0 \
   -sdk "$SDK" \
   -module-cache-path build/module-cache \
-  Sources/KeychainAPI/KeychainAPI.swift \
+  Sources/KeychainAPI/*.swift \
   -framework Security \
   -framework LocalAuthentication \
   -framework Network \
@@ -82,7 +82,31 @@ xcrun lipo -create \
 
 Strip and sign only the combined executable. The selected compiler and SDK must come from a compatible Xcode or Command Line Tools installation.
 
+### Source layout
+
+The files in `Sources/KeychainAPI` form one executable target:
+
+| File | Responsibility |
+| --- | --- |
+| `CLI.swift` | Command arguments, dispatch, and usage |
+| `Policy.swift` | Policy types, parsing, and operation authorization |
+| `HTTPTransport.swift` | HTTPS sessions and response handling |
+| `OnePassword.swift` | 1Password arguments, input preparation, and subprocess handling |
+| `Keychain.swift` | Keychain access |
+| `ProtectedFiles.swift` | Private input and durable response files |
+| `JSONSafety.swift` | Credential detection, JSON validation, and redaction |
+| `Support.swift` | Shared errors, limits, and metadata checks |
+| `SelfTests.swift` | Offline checks run by `keychain-api self-test` |
+| `CLISelfTests.swift` | Command dispatch, refusal ordering, and output checks |
+| `HTTPTransportSelfTests.swift` | Deterministic HTTP response and recovery checks |
+
 ## Policy
+
+The client uses three terms throughout this guide:
+
+- A **profile** fixes a trusted origin, Keychain credential references, and allowed operations.
+- An **operation** permits an HTTP method/path combination or an exact 1Password command. It does not authorize every possible mutation within that permission.
+- **Protected output** is a new private plaintext file that receives sensitive results without printing them.
 
 The tool reads exactly one policy file:
 
@@ -122,6 +146,8 @@ Every profile requires a nonempty `operations` array. An HTTP operation uses eit
 - `methods` plus a trailing-slash `path_prefix`.
 
 Supported methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE`. Body policies are `none`, `json`, and `optional-json`. Response policies are `json`, `empty`, and `json-or-empty`.
+
+The same compatibility rules apply to exact paths and path prefixes. `GET` and `HEAD` never accept a request body, so an operation containing either method cannot require `body: "json"`. An operation containing `HEAD` must use `response: "empty"` or `response: "json-or-empty"`; `response: "json"` is refused. These combinations are checked when the policy is loaded, and body rules are checked again for each request.
 
 A 1Password operation contains only `command`, such as `{"command": "vault list"}`. HTTP profiles cannot contain command entries, and 1Password profiles cannot contain HTTP method/path entries. Mixing the two forms is rejected.
 
@@ -283,6 +309,10 @@ The example origin is intentionally non-routable. Replace it with the exact trus
 
 For HTTP profiles, successful responses are emitted as formatted, sanitized JSON. The client rejects unsafe redirects, origin changes, unexpected media types, non-2xx responses, invalid JSON, and responses containing the configured request credentials. Recognized sensitive fields and credential-shaped values are redacted from normal output. Errors are deliberately terse to reduce accidental disclosure. Redaction is defense in depth: arbitrary free-form response content is not guaranteed safe to print. The 1Password adapter always saves output privately and prints only a protected-file receipt on success.
 
+JSON credential checks require UTF-8 without NUL bytes. They inspect decoded string literals before parsing the object, so duplicate member names cannot hide an escaped authentication credential. Accepted protected responses retain their original bytes.
+
+This UTF-8 restriction also applies when `read` or `document get` returns content recognized as JSON: UTF-16/32 JSON documents are refused. Other binary output remains preserved in its base64 envelope.
+
 ### Opt-in protected JSON file
 
 Use `--secret-output-file` when an authorized API operation returns a sensitive response that must not appear in terminal output. It uses the same transport and reusable policy profile; it does not require a provider-specific helper, change authentication, or expand the allowed origin, methods, or paths. The example profile targets the reserved origin `https://api.example.invalid`.
@@ -301,9 +331,9 @@ The helper reserves a new file before reading Keychain credentials or making a n
 - An absolute path without traversal, repeated separators, or symlinks in any component. On macOS, use `/private/tmp` rather than the `/tmp` symlink.
 - An existing directory owned by the current user, with no group/other permissions or extended ACL entries; mode `0700` is appropriate. Ancestors must be owned by root or the current user and must not be group/other writable unless sticky.
 - A new regular output file, created exclusively with mode `0600`, owned by the current user, with one hard link and no extended ACL entries. Existing files are never overwritten.
-- A `json` or `json-or-empty` response policy and a nonempty valid JSON response. An empty response is not a successful secret-file write.
+- A `json` or `json-or-empty` response policy. A successful write requires a nonempty valid JSON response; an empty response is not a successful secret-file write.
 
-The file contains the **entire JSON response**, before normal output redaction, not just a selected token field. Responses echoing the configured request credentials are still rejected. Successful persistence prints only this fixed receipt; no response fields or file contents are printed:
+On success, the file contains the **entire JSON response**, before normal output redaction, not just a selected token field. Responses echoing the configured request credentials are still rejected. Successful persistence prints only this fixed receipt; no response fields or file contents are printed:
 
 ```json
 {
@@ -319,6 +349,8 @@ The saved file is **plaintext**, not an encrypted store or a Keychain item. Perm
 
 An error can leave an empty, partial, or complete file, which is deliberately retained. File existence does not prove successful persistence, and a missing success receipt does not prove that a remote mutation failed. Do not automatically retry a timeout, interrupted response, or persistence error. Check remote state without exposing secrets before deciding on recovery or another request.
 
+If an HTTP response stream is interrupted or exceeds the size limit while being read, received bytes up to the 8 MiB limit are saved to the protected output after credential checks. Complete JSON must pass the normal credential checks. Incomplete JSON is retained only when it is UTF-8 and contains no NUL or backslash bytes; otherwise the output is refused. The command still exits with code `5` and prints no success receipt. Retained bytes are recovery evidence and may be incomplete or invalid JSON, not proof that a mutation succeeded.
+
 ### Offline self-test
 
 `self-test` performs no Keychain read and no network request:
@@ -327,7 +359,11 @@ An error can leave an empty, partial, or complete file, which is deliberately re
 keychain-api self-test
 ```
 
-It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged, validates proxy policy, and verifies that supported proxy sessions disable direct fallback. Authentication checks cover supported HTTP header schemes, conflicting credentials, 1Password destination mismatches, attempts to send a service account token as an HTTP header, command allowlists, unsafe argument overrides, protected input checks, binary response preservation, and inert subprocess tests for input delivery, environment isolation, cleanup, and failed-command response retention. Shared bounded-read tests cover complete input and size-limited partial capture; JSON credential checks cover escaped values in request bodies and responses. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
+It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged, validates proxy policy, and verifies that supported proxy sessions disable direct fallback.
+
+Command dispatch tests exercise production argument handling and authorization with inert credential and subprocess fixtures. They check refusal before credential access or process execution, fixed success receipts, failure exit codes, diagnostic suppression, and retained recovery output. Authentication checks also cover supported HTTP header schemes, conflicting credentials, 1Password destination mismatches, service account token misuse as an HTTP header, unsafe argument overrides, protected inputs, binary response preservation, environment isolation, and cleanup.
+
+Deterministic HTTP fixtures exercise request construction, response validation, redaction, protected receipts, interrupted responses, bounded overflow recovery, and refusal of authentication credential echoes. Shared JSON checks cover escaped strings, duplicate member names, and non-UTF-8 encodings. Shared bounded-read tests cover complete input and size-limited partial capture. A targeted manual mutation removing the CLI command allowlist check was caught by the dispatch tests; this is not comprehensive mutation analysis. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
 
 ## Exit codes
 
