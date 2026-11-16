@@ -12,19 +12,26 @@ enum CredentialPlacement {
         return false
     }
 
+    var headerName: String {
+        switch self {
+        case .header(let name, _): return name
+        case .bearer, .apiKey, .basic, .onePasswordServiceAccount: return "Authorization"
+        }
+    }
+
     func requestHeader(secret: String) throws -> (name: String, value: String) {
         switch self {
         case .onePasswordServiceAccount:
             throw fail("Service account tokens cannot be sent as HTTP headers.", exitCode: 3)
         case .bearer:
-            return ("Authorization", "Bearer \(secret)")
+            return (headerName, "Bearer \(secret)")
         case .apiKey:
-            return ("Authorization", "APIKey \(secret)")
+            return (headerName, "APIKey \(secret)")
         case .basic(let username):
             let encoded = Data((username + ":" + secret).utf8).base64EncodedString()
-            return ("Authorization", "Basic \(encoded)")
-        case .header(let name, let prefix):
-            return (name, prefix + secret)
+            return (headerName, "Basic \(encoded)")
+        case .header(_, let prefix):
+            return (headerName, prefix + secret)
         }
     }
 }
@@ -53,9 +60,13 @@ enum BodyPolicy: String {
     case json
     case optionalJSON = "optional-json"
 
+    func permits(method: String, hasBody: Bool) -> Bool {
+        (!hasBody || (self != .none && method != "GET" && method != "HEAD"))
+            && (hasBody || self != .json)
+    }
+
     func validate(method: String, hasBody: Bool) throws {
-        guard !hasBody || (self != .none && method != "GET" && method != "HEAD"),
-              hasBody || self != .json else {
+        guard permits(method: method, hasBody: hasBody) else {
             throw fail("The request body does not match the selected policy operation.", exitCode: 2)
         }
     }
@@ -316,48 +327,39 @@ func parseOperation(_ raw: Any) throws -> OperationPolicy {
         throw fail("A policy profile contains an invalid operation.", exitCode: 3)
     }
 
+    let methods: Set<String>
+    let path: PathPolicy
     if let rawMethod = dictionary["method"] as? String,
-       let path = dictionary["path"] as? String,
+       let exactPath = dictionary["path"] as? String,
        dictionary["methods"] == nil,
        dictionary["path_prefix"] == nil {
         guard supportedHTTPMethods.contains(rawMethod),
-              validateOperationPath(path) else {
+              validateOperationPath(exactPath) else {
             throw fail("A policy profile contains an invalid exact operation.", exitCode: 3)
         }
-        if (rawMethod == "GET" || rawMethod == "HEAD") && body != .none {
-            throw fail("GET and HEAD operations cannot have request bodies.", exitCode: 3)
-        }
-        if rawMethod == "HEAD" && response != .empty {
-            throw fail("HEAD operations must use an empty response policy.", exitCode: 3)
-        }
-        return OperationPolicy(
-            methods: [rawMethod],
-            path: .exact(path),
-            body: body,
-            response: response
-        )
-    }
-
-    if let rawMethods = dictionary["methods"] as? [String],
+        methods = [rawMethod]
+        path = .exact(exactPath)
+    } else if let rawMethods = dictionary["methods"] as? [String],
        let pathPrefix = dictionary["path_prefix"] as? String,
        dictionary["method"] == nil,
        dictionary["path"] == nil {
-        let methods = Set(rawMethods)
+        methods = Set(rawMethods)
         guard !methods.isEmpty,
               methods.count == rawMethods.count,
               methods.isSubset(of: supportedHTTPMethods),
               validateOperationPrefix(pathPrefix) else {
             throw fail("A policy profile contains an invalid prefix operation.", exitCode: 3)
         }
-        return OperationPolicy(
-            methods: methods,
-            path: .prefix(pathPrefix),
-            body: body,
-            response: response
-        )
+        path = .prefix(pathPrefix)
+    } else {
+        throw fail("A policy operation must define either an exact path or a path prefix.", exitCode: 3)
     }
 
-    throw fail("A policy operation must define either an exact path or a path prefix.", exitCode: 3)
+    guard methods.allSatisfy({ body.permits(method: $0, hasBody: false) || body.permits(method: $0, hasBody: true) }),
+          !methods.contains("HEAD") || response != .json else {
+        throw fail("An operation requires a body or response forbidden by its HTTP method.", exitCode: 3)
+    }
+    return OperationPolicy(methods: methods, path: path, body: body, response: response)
 }
 
 func parseProfile(name: String, dictionary: [String: Any]) throws -> ProfilePolicy {
@@ -408,11 +410,7 @@ func parseProfile(name: String, dictionary: [String: Any]) throws -> ProfilePoli
 
     var headerNames = Set<String>()
     for credential in credentials {
-        let headerName: String
-        switch credential.placement {
-        case .bearer, .apiKey, .basic, .onePasswordServiceAccount: headerName = "authorization"
-        case .header(let name, _): headerName = name.lowercased()
-        }
+        let headerName = credential.placement.headerName.lowercased()
         guard headerNames.insert(headerName).inserted else {
             throw fail("A policy profile defines a credential header more than once.", exitCode: 3)
         }

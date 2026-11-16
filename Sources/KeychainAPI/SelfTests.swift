@@ -164,6 +164,7 @@ private func runOnePasswordSelfTest() throws {
 }
 
 func runSelfTest() throws {
+    try runOperationPolicySelfTests()
     try runOnePasswordSelfTest()
     let marker = "INERT_AUTH_SELF_TEST"
     let authFixture: [String: Any] = [
@@ -406,6 +407,50 @@ func runSelfTest() throws {
         "protected_file_tests_passed": true,
         "passed": true
     ])
+}
+
+private func runOperationPolicySelfTests() throws {
+    for method in ["GET", "HEAD"] {
+        for pathFields: [String: Any] in [
+            ["methods": [method], "path_prefix": "/v1/"],
+            ["method": method, "path": "/v1/check"]
+        ] {
+            var operation = pathFields
+            operation["body"] = "json"
+            operation["response"] = "json-or-empty"
+            try expectFailure("impossible required body on " + method, exitCode: 3) {
+                _ = try parseOperation(operation)
+            }
+            operation["body"] = "optional-json"
+            let parsed = try parseOperation(operation)
+            try parsed.body.validate(method: method, hasBody: false)
+            try expectFailure("body on " + method, exitCode: 2) {
+                try parsed.body.validate(method: method, hasBody: true)
+            }
+            if method == "HEAD" {
+                operation["response"] = "json"
+                try expectFailure("HEAD requiring response bytes", exitCode: 3) {
+                    _ = try parseOperation(operation)
+                }
+            }
+        }
+    }
+    let mixed = try parseOperation([
+        "methods": ["GET", "HEAD", "POST"], "path_prefix": "/v1/",
+        "body": "optional-json", "response": "json-or-empty"
+    ])
+    guard mixed.permits(method: "GET", relativePath: "/v1/check"),
+          mixed.permits(method: "POST", relativePath: "/v1/check") else {
+        throw fail("Self-test failed: valid mixed-method operation rejected.")
+    }
+    try mixed.body.validate(method: "GET", hasBody: false)
+    try mixed.body.validate(method: "POST", hasBody: true)
+    try expectFailure("mixed operation with impossible GET body", exitCode: 3) {
+        _ = try parseOperation([
+            "methods": ["GET", "POST"], "path_prefix": "/v1/",
+            "body": "json", "response": "json"
+        ])
+    }
 }
 
 private func runProtectedResponseFileSelfTest() throws {
