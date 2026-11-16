@@ -21,7 +21,7 @@ release:
 	$(MAKE) build CONFIGURATION=release
 
 test:
-	$(SWIFT) run $(BINARY) self-test
+	$(SWIFT) run --configuration $(CONFIGURATION) $(BINARY) self-test
 
 sign: release
 	$(CODESIGN) --force --sign "$(CODESIGN_IDENTITY)" --options runtime --identifier "$(CODESIGN_IDENTIFIER)" "$$($(SWIFT) build --configuration release --show-bin-path)/$(BINARY)"
