@@ -99,6 +99,19 @@ final class APITransport {
         return url
     }
 
+    private static func saveInterruptedResponse(_ data: Data, forbiddenSecrets: [String],
+                                                output: ProtectedResponseFile?) throws {
+        guard let output, !data.isEmpty else { return }
+        try checkJSONCredentialEcho(data, forbiddenSecrets: forbiddenSecrets, exitCode: 5)
+        if (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) == nil {
+            // An incomplete JSON escape could conceal a credential. Refuse it rather than guess its decoded value.
+            guard !data.contains(UInt8(ascii: "\\")) else {
+                throw fail("The interrupted API response could not be checked safely; output was refused. Verify remote state before retrying.", exitCode: 5)
+            }
+        }
+        _ = try output.commit(data)
+    }
+
     func send(
         profile: ProfilePolicy,
         operation: OperationPolicy,
@@ -108,6 +121,22 @@ final class APITransport {
         secrets: [String],
         secretOutput: ProtectedResponseFile? = nil
     ) async throws -> Any {
+        try await send(profile: profile, operation: operation, method: method,
+                       relativePath: relativePath, body: body, secrets: secrets,
+                       secretOutput: secretOutput, loadResponse: { try await self.session.bytes(for: $0) })
+    }
+
+    // Keep the byte source separate so transport behavior can be exercised without a live service.
+    func send<Bytes: AsyncSequence>(
+        profile: ProfilePolicy,
+        operation: OperationPolicy,
+        method: String,
+        relativePath: String,
+        body: Data?,
+        secrets: [String],
+        secretOutput: ProtectedResponseFile? = nil,
+        loadResponse: (URLRequest) async throws -> (Bytes, URLResponse)
+    ) async throws -> Any where Bytes.Element == UInt8 {
         let url = try Self.requestURL(
             origin: profile.origin,
             relativePath: relativePath,
@@ -133,10 +162,10 @@ final class APITransport {
             request.setValue(profile.mediaType.rawValue, forHTTPHeaderField: "Content-Type")
         }
 
-        let bytes: URLSession.AsyncBytes
+        let bytes: Bytes
         let response: URLResponse
         do {
-            (bytes, response) = try await session.bytes(for: request)
+            (bytes, response) = try await loadResponse(request)
         } catch {
             throw fail("No API response was received. A remote mutation may have succeeded; verify state before retrying.", exitCode: 5)
         }
@@ -171,10 +200,11 @@ final class APITransport {
                 }
                 data.append(byte)
             }
-        } catch let failure as SafeFailure {
-            throw failure
         } catch {
-            throw fail("The API response ended unexpectedly. A remote mutation may have succeeded; verify state before retrying.", exitCode: 5)
+            let failure = error as? SafeFailure
+                ?? fail("The API response ended unexpectedly. Check protected output and remote state before retrying.", exitCode: 5)
+            try Self.saveInterruptedResponse(data, forbiddenSecrets: forbiddenArtifacts, output: secretOutput)
+            throw failure
         }
         if data.isEmpty && operation.response == .jsonOrEmpty {
             guard secretOutput == nil else {

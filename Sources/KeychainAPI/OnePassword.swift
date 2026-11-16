@@ -128,15 +128,16 @@ func prepareOnePasswordInput(_ input: Data?, command: String, arguments: [String
 
 func onePasswordProtectedResponse(_ data: Data, command: String, token: String) throws -> Data {
     let artifacts = credentialArtifacts([token])
-    guard !dataContainsAnySecret(data, secrets: artifacts) else {
+    if data.isEmpty { return try encodedJSON(["ok": true]) }
+    let expectsJSON = command != "read" && command != "document get"
+    let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])
+    if expectsJSON || object != nil {
+        try checkJSONCredentialEcho(data, forbiddenSecrets: artifacts, exitCode: 5)
+    } else if dataContainsAnySecret(data, secrets: artifacts) {
         throw fail("The CLI response echoed the authentication credential; output was refused.", exitCode: 5)
     }
-    if data.isEmpty { return try encodedJSON(["ok": true]) }
-    if let object = try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed]) {
-        guard !objectContainsAnySecret(object, secrets: artifacts) else {
-            throw fail("The CLI response echoed the authentication credential; output was refused.", exitCode: 5)
-        }
-        if command != "read", command != "document get", JSONSerialization.isValidJSONObject(object) { return data }
+    if expectsJSON, let object, JSONSerialization.isValidJSONObject(object) {
+        return data
     }
     // Binary downloads and plaintext field values remain private inside a JSON envelope.
     return try encodedJSON(["encoding": "base64", "data": data.base64EncodedString()])

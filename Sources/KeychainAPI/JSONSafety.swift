@@ -26,10 +26,56 @@ func credentialArtifacts(_ secrets: [String]) -> [String] {
     Array(Set(secrets + secrets.map { Data($0.utf8).base64EncodedString() }))
 }
 
+private func checkEscapedJSONLiteral(_ data: Data, forbiddenSecrets: [String], exitCode: Int32) throws {
+    guard let string = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? String,
+          !forbiddenSecrets.contains(where: { !$0.isEmpty && string.contains($0) }) else {
+        throw fail("JSON was invalid or contained authentication credential material.", exitCode: exitCode)
+    }
+}
+
+func checkJSONCredentialEcho(_ data: Data, forbiddenSecrets: [String], exitCode: Int32) throws {
+    // JSON structural bytes are ASCII. Reject UTF-16/32 rather than scan their bytes as UTF-8.
+    guard String(data: data, encoding: .utf8) != nil, !data.contains(0),
+          !dataContainsAnySecret(data, secrets: forbiddenSecrets) else {
+        throw fail("JSON was invalid or contained authentication credential material.", exitCode: exitCode)
+    }
+    var literalStart: Data.Index?
+    var escaped = false
+    var needsDecoding = false
+    for index in data.indices {
+        let byte = data[index]
+        guard let start = literalStart else {
+            if byte == UInt8(ascii: "\"") { literalStart = index }
+            continue
+        }
+        if escaped {
+            escaped = false
+            continue
+        }
+        switch byte {
+        case UInt8(ascii: "\\"):
+            escaped = true
+            needsDecoding = true
+        case UInt8(ascii: "\""):
+            if needsDecoding {
+                // Inspect every literal, including members a dictionary parser would discard as duplicates.
+                try checkEscapedJSONLiteral(data.subdata(in: start..<data.index(after: index)),
+                                            forbiddenSecrets: forbiddenSecrets, exitCode: exitCode)
+            }
+            literalStart = nil
+            needsDecoding = false
+        default:
+            break
+        }
+    }
+    guard literalStart == nil || !needsDecoding else {
+        throw fail("An incomplete JSON string could not be checked for authentication credential material.", exitCode: exitCode)
+    }
+}
+
 func checkedJSON(_ data: Data, forbiddenSecrets: [String], exitCode: Int32) throws -> Any {
-    guard !dataContainsAnySecret(data, secrets: forbiddenSecrets),
-          let object = try? JSONSerialization.jsonObject(with: data),
-          !objectContainsAnySecret(object, secrets: forbiddenSecrets) else {
+    try checkJSONCredentialEcho(data, forbiddenSecrets: forbiddenSecrets, exitCode: exitCode)
+    guard let object = try? JSONSerialization.jsonObject(with: data) else {
         throw fail("JSON was invalid or contained authentication credential material.", exitCode: exitCode)
     }
     return object

@@ -74,7 +74,14 @@ private func runOnePasswordSelfTest() throws {
         throw fail("Self-test failed: binary response preservation.")
     }
     try expectFailure("1Password input") { _ = try onePasswordProtectedResponse(Data("INERT_AUTH".utf8), command: "read", token: "INERT_AUTH") }
-    for encoded in [#"{"value":"INERT_\u0041UTH"}"#, #""INERT_\u0041UTH""#] {
+    try expectFailure("truncated CLI JSON credential echo", exitCode: 5) {
+        _ = try onePasswordProtectedResponse(Data(#"{"value":"INERT_\u0041UTH""#.utf8),
+                                             command: "item create", token: "INERT_AUTH")
+    }
+    for encoded in [#"{"value":"INERT_\u0041UTH"}"#, #""INERT_\u0041UTH""#,
+                    #"{"value":"safe","value":"INERT_\u0041UTH"}"#,
+                    #"{"value":"INERT_\u0041UTH","value":"safe"}"#,
+                    #"{"value":"safe","\u0076alue":"INERT_\u0041UTH"}"#] {
         for command in ["item get", "read"] {
             try expectFailure("escaped CLI credential echo", exitCode: 5) {
                 _ = try onePasswordProtectedResponse(Data(encoded.utf8), command: command, token: "INERT_AUTH")
@@ -166,6 +173,7 @@ private func runOnePasswordSelfTest() throws {
 func runSelfTest() async throws {
     try runOperationPolicySelfTests()
     try await runCLISelfTests()
+    try await runHTTPTransportSelfTests()
     try runOnePasswordSelfTest()
     let marker = "INERT_AUTH_SELF_TEST"
     let authFixture: [String: Any] = [
