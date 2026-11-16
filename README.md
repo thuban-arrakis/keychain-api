@@ -18,7 +18,7 @@ Build an optimized executable with Swift Package Manager:
 
 ```sh
 swift build --configuration release
-swift run keychain-api self-test
+swift run --configuration release keychain-api self-test
 ```
 
 The resulting executable is under the directory printed by:
@@ -57,7 +57,7 @@ xcrun swiftc \
   -target arm64-apple-macosx12.0 \
   -sdk "$SDK" \
   -module-cache-path build/module-cache \
-  Sources/KeychainAPI/KeychainAPI.swift \
+  Sources/KeychainAPI/*.swift \
   -framework Security \
   -framework LocalAuthentication \
   -framework Network \
@@ -81,6 +81,22 @@ xcrun lipo -create \
 ```
 
 Strip and sign only the combined executable. The selected compiler and SDK must come from a compatible Xcode or Command Line Tools installation.
+
+### Source layout
+
+The files in `Sources/KeychainAPI` form one executable target:
+
+| File | Responsibility |
+| --- | --- |
+| `CLI.swift` | Command arguments, dispatch, and usage |
+| `Policy.swift` | Policy types, parsing, and operation authorization |
+| `HTTPTransport.swift` | HTTPS sessions and response handling |
+| `OnePassword.swift` | 1Password arguments, input preparation, and subprocess handling |
+| `Keychain.swift` | Keychain access |
+| `ProtectedFiles.swift` | Private input and durable response files |
+| `JSONSafety.swift` | Credential detection, JSON validation, and redaction |
+| `Support.swift` | Shared errors, limits, and metadata checks |
+| `SelfTests.swift` | Offline checks run by `keychain-api self-test` |
 
 ## Policy
 
