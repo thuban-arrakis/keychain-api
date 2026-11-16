@@ -19,10 +19,6 @@ func fail(_ message: String, exitCode: Int32 = 1) -> SafeFailure {
     SafeFailure(message, exitCode: exitCode)
 }
 
-func writeError(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
-}
-
 func containsControlCharacters(_ value: String) -> Bool {
     value.unicodeScalars.contains { CharacterSet.controlCharacters.contains($0) }
 }

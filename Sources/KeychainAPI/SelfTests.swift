@@ -163,8 +163,9 @@ private func runOnePasswordSelfTest() throws {
     guard !expired.data.isEmpty else { throw fail("Self-test failed: timeout response capture.") }
 }
 
-func runSelfTest() throws {
+func runSelfTest() async throws {
     try runOperationPolicySelfTests()
+    try await runCLISelfTests()
     try runOnePasswordSelfTest()
     let marker = "INERT_AUTH_SELF_TEST"
     let authFixture: [String: Any] = [

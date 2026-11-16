@@ -188,8 +188,12 @@ func encodedJSON(_ object: Any, forbiddenSecrets: [String] = []) throws -> Data 
     return data
 }
 
-func emitJSON(_ object: Any, forbiddenSecrets: [String] = []) throws {
+func emitJSON(
+    _ object: Any,
+    forbiddenSecrets: [String] = [],
+    write: (Data) -> Void = { FileHandle.standardOutput.write($0) }
+) throws {
     let data = try encodedJSON(object, forbiddenSecrets: forbiddenSecrets)
-    FileHandle.standardOutput.write(data)
-    FileHandle.standardOutput.write(Data("\n".utf8))
+    write(data)
+    write(Data("\n".utf8))
 }

@@ -83,147 +83,163 @@ private func usage() -> String {
     """
 }
 
+// Only external effects vary in self-tests; parsing, authorization, execution,
+// protected persistence, and exit classification use the production handlers.
+struct CLIDependencies {
+    let loadPolicy: () throws -> PolicyStore
+    let credentialExists: (CredentialPolicy) throws -> Bool
+    let credentialValue: (CredentialPolicy) throws -> String
+    let authorizeCredential: (CredentialPolicy, LAContext) throws -> Void
+    let onePasswordExecutable: () throws -> URL
+    let stdout: (Data) -> Void
+    let stderr: (Data) -> Void
+
+    static var live: CLIDependencies {
+        CLIDependencies(
+            loadPolicy: PolicyStore.load,
+            credentialExists: KeychainReader.exists,
+            credentialValue: KeychainReader.value,
+            authorizeCredential: { try KeychainReader.authorize($0, context: $1) },
+            onePasswordExecutable: verifiedOnePasswordExecutable,
+            stdout: { FileHandle.standardOutput.write($0) },
+            stderr: { FileHandle.standardError.write($0) }
+        )
+    }
+}
+
+private func loadProfile(_ name: String, dependencies: CLIDependencies) throws -> ProfilePolicy {
+    guard let profile = try dependencies.loadPolicy().profiles[name] else {
+        throw fail("The requested profile is not defined.", exitCode: 2)
+    }
+    return profile
+}
+
+private func handleStatus(_ arguments: [String], dependencies: CLIDependencies) throws {
+    guard arguments.count == 2 else { throw fail("status requires one profile.", exitCode: 2) }
+    let profile = try loadProfile(arguments[1], dependencies: dependencies)
+    var results: [[String: Any]] = []
+    for (index, credential) in profile.credentials.enumerated() {
+        results.append(["found": try dependencies.credentialExists(credential), "index": index + 1])
+    }
+    try emitJSON([
+        "credentials": results, "network_used": false, "profile": profile.name, "secret_read": false
+    ], write: dependencies.stdout)
+}
+
+private func handleAuthorize(_ arguments: [String], dependencies: CLIDependencies) throws {
+    guard arguments.count == 2 else { throw fail("authorize requires one profile.", exitCode: 2) }
+    let profile = try loadProfile(arguments[1], dependencies: dependencies)
+    let context = LAContext()
+    context.interactionNotAllowed = false
+    context.localizedReason = "Allow access to configured API credentials."
+    context.touchIDAuthenticationAllowableReuseDuration = 0
+    defer { context.invalidate() }
+    for credential in profile.credentials {
+        try dependencies.authorizeCredential(credential, context)
+    }
+    try emitJSON([
+        "credentials_read": profile.credentials.count, "network_used": false,
+        "profile": profile.name, "secret_output": false, "secret_read": true
+    ], write: dependencies.stdout)
+}
+
+private func handleOnePassword(_ arguments: [String], dependencies: CLIDependencies) throws {
+    guard arguments.count >= 6 else { throw fail("op arguments are incomplete.", exitCode: 2) }
+    let store = try dependencies.loadPolicy()
+    guard let profile = store.profiles[arguments[1]], case .onePassword = profile.operations else {
+        throw fail("op requires a 1Password service-account profile.", exitCode: 2)
+    }
+    let options = try parseOptionPairs(Array(arguments.dropFirst(2)), allowed: [
+        "--command", "--args-file", "--input-file", "--secret-output-file"
+    ])
+    guard let command = options["--command"], profile.operations.permits(command: command),
+          let outputPath = options["--secret-output-file"] else {
+        throw fail("op requires a policy-allowed command and a new protected output file.", exitCode: 2)
+    }
+    let rawArguments = try options["--args-file"].map { path -> [String] in
+        let data = try readProtectedInput(at: path, maximumBytes: maximumBodyBytes)
+        guard let array = try? JSONSerialization.jsonObject(with: data) as? [String] else {
+            throw fail("CLI arguments must be a private JSON array of non-secret strings.", exitCode: 3)
+        }
+        return array
+    } ?? []
+    try validateOnePasswordArguments(rawArguments, command: command)
+    let input = try options["--input-file"].map { try readProtectedInput(at: $0, maximumBytes: maximumResponseBytes) }
+    let preparedInput = try prepareOnePasswordInput(input, command: command, arguments: rawArguments)
+    let secretOutput = try ProtectedResponseFile(path: outputPath)
+    let executable = try dependencies.onePasswordExecutable()
+    let token = try dependencies.credentialValue(profile.credentials[0])
+    let result = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
+                                          command: command, arguments: rawArguments, input: preparedInput)
+    try emitJSON(saveOnePasswordResult(result, command: command, token: token, output: secretOutput),
+                 write: dependencies.stdout)
+}
+
+private func handleRequest(_ arguments: [String], dependencies: CLIDependencies) async throws {
+    guard arguments.count >= 6 else { throw fail("request arguments are incomplete.", exitCode: 2) }
+    let profile = try loadProfile(arguments[1], dependencies: dependencies)
+    let options = try parseRequestOptions(Array(arguments.dropFirst(2)))
+    let operation = try operationForRequest(profile: profile, method: options.method, relativePath: options.path)
+    let body = try options.bodyFile.map(readJSONBody)
+    try operation.body.validate(method: options.method, hasBody: body != nil)
+    guard options.secretOutputFile == nil || operation.response != .empty else {
+        throw fail("Secret output requires a JSON response policy.", exitCode: 2)
+    }
+    let transport = try APITransport(proxy: profile.proxy)
+    let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
+    var secrets = try profile.credentials.map(dependencies.credentialValue)
+    defer {
+        for index in secrets.indices {
+            secrets[index].removeAll(keepingCapacity: false)
+        }
+    }
+    let result = try await transport.send(
+        profile: profile, operation: operation, method: options.method, relativePath: options.path,
+        body: body, secrets: secrets, secretOutput: secretOutput
+    )
+    let forbiddenArtifacts = forbiddenCredentialArtifacts(profile: profile, secrets: secrets)
+    try emitJSON(result, forbiddenSecrets: forbiddenArtifacts, write: dependencies.stdout)
+}
+
+private func dispatchCLI(_ arguments: [String], dependencies: CLIDependencies) async throws {
+    guard let command = arguments.first else { throw fail(usage(), exitCode: 2) }
+    switch command {
+    case "help", "--help", "-h":
+        guard arguments.count == 1 else { throw fail("help accepts no arguments.", exitCode: 2) }
+        dependencies.stdout(Data((usage() + "\n").utf8))
+    case "self-test":
+        guard arguments.count == 1 else { throw fail("self-test accepts no arguments.", exitCode: 2) }
+        try await runSelfTest()
+    case "status":
+        try handleStatus(arguments, dependencies: dependencies)
+    case "authorize":
+        try handleAuthorize(arguments, dependencies: dependencies)
+    case "op":
+        try handleOnePassword(arguments, dependencies: dependencies)
+    case "request":
+        try await handleRequest(arguments, dependencies: dependencies)
+    default:
+        throw fail("Unknown command.\n\n" + usage(), exitCode: 2)
+    }
+}
+
+func runCLI(_ arguments: [String], dependencies: CLIDependencies = .live) async -> Int32 {
+    do {
+        try await dispatchCLI(arguments, dependencies: dependencies)
+        return 0
+    } catch let failure as SafeFailure {
+        dependencies.stderr(Data((failure.message + "\n").utf8))
+        return failure.exitCode
+    } catch {
+        dependencies.stderr(Data("The operation failed safely; no credential or raw diagnostic was printed.\n".utf8))
+        return 1
+    }
+}
+
 @main
 private enum KeychainAPICLI {
     static func main() async {
-        do {
-            let arguments = Array(CommandLine.arguments.dropFirst())
-            guard let command = arguments.first else {
-                throw fail(usage(), exitCode: 2)
-            }
-
-            switch command {
-            case "help", "--help", "-h":
-                guard arguments.count == 1 else { throw fail("help accepts no arguments.", exitCode: 2) }
-                print(usage())
-
-            case "self-test":
-                guard arguments.count == 1 else { throw fail("self-test accepts no arguments.", exitCode: 2) }
-                try runSelfTest()
-
-            case "status":
-                guard arguments.count == 2 else { throw fail("status requires one profile.", exitCode: 2) }
-                let store = try PolicyStore.load()
-                let profileName = arguments[1]
-                guard let profile = store.profiles[profileName] else {
-                    throw fail("The requested profile is not defined.", exitCode: 2)
-                }
-                var results: [[String: Any]] = []
-                for (index, credential) in profile.credentials.enumerated() {
-                    results.append([
-                        "found": try KeychainReader.exists(credential),
-                        "index": index + 1
-                    ])
-                }
-                try emitJSON([
-                    "credentials": results,
-                    "network_used": false,
-                    "profile": profile.name,
-                    "secret_read": false
-                ])
-
-            case "authorize":
-                guard arguments.count == 2 else { throw fail("authorize requires one profile.", exitCode: 2) }
-                let store = try PolicyStore.load()
-                let profileName = arguments[1]
-                guard let profile = store.profiles[profileName] else {
-                    throw fail("The requested profile is not defined.", exitCode: 2)
-                }
-                let context = LAContext()
-                context.interactionNotAllowed = false
-                context.localizedReason = "Allow access to configured API credentials."
-                context.touchIDAuthenticationAllowableReuseDuration = 0
-                defer { context.invalidate() }
-                for credential in profile.credentials {
-                    try KeychainReader.authorize(credential, context: context)
-                }
-                try emitJSON([
-                    "credentials_read": profile.credentials.count,
-                    "network_used": false,
-                    "profile": profile.name,
-                    "secret_output": false,
-                    "secret_read": true
-                ])
-
-            case "op":
-                guard arguments.count >= 6 else { throw fail("op arguments are incomplete.", exitCode: 2) }
-                let store = try PolicyStore.load()
-                guard let profile = store.profiles[arguments[1]], case .onePassword = profile.operations else {
-                    throw fail("op requires a 1Password service-account profile.", exitCode: 2)
-                }
-                let options = try parseOptionPairs(Array(arguments.dropFirst(2)), allowed: [
-                    "--command", "--args-file", "--input-file", "--secret-output-file"
-                ])
-                guard let command = options["--command"], profile.operations.permits(command: command),
-                      let outputPath = options["--secret-output-file"] else {
-                    throw fail("op requires a policy-allowed command and a new protected output file.", exitCode: 2)
-                }
-                let rawArguments = try options["--args-file"].map { path -> [String] in
-                    let data = try readProtectedInput(at: path, maximumBytes: maximumBodyBytes)
-                    guard let array = try? JSONSerialization.jsonObject(with: data) as? [String] else {
-                        throw fail("CLI arguments must be a private JSON array of non-secret strings.", exitCode: 3)
-                    }
-                    return array
-                } ?? []
-                try validateOnePasswordArguments(rawArguments, command: command)
-                let input = try options["--input-file"].map { try readProtectedInput(at: $0, maximumBytes: maximumResponseBytes) }
-                let preparedInput = try prepareOnePasswordInput(input, command: command, arguments: rawArguments)
-                let secretOutput = try ProtectedResponseFile(path: outputPath)
-                let executable = try verifiedOnePasswordExecutable()
-                let token = try KeychainReader.value(profile.credentials[0])
-                let result = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
-                                                      command: command, arguments: rawArguments, input: preparedInput)
-                try emitJSON(saveOnePasswordResult(result, command: command, token: token, output: secretOutput))
-
-            case "request":
-                guard arguments.count >= 6 else { throw fail("request arguments are incomplete.", exitCode: 2) }
-                let store = try PolicyStore.load()
-                let profileName = arguments[1]
-                guard let profile = store.profiles[profileName] else {
-                    throw fail("The requested profile is not defined.", exitCode: 2)
-                }
-                let options = try parseRequestOptions(Array(arguments.dropFirst(2)))
-                let operation = try operationForRequest(
-                    profile: profile,
-                    method: options.method,
-                    relativePath: options.path
-                )
-                let body = try options.bodyFile.map(readJSONBody)
-                try operation.body.validate(method: options.method, hasBody: body != nil)
-
-                guard options.secretOutputFile == nil || operation.response != .empty else {
-                    throw fail("Secret output requires a JSON response policy.", exitCode: 2)
-                }
-                let transport = try APITransport(proxy: profile.proxy)
-                let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
-
-                var secrets = try profile.credentials.map(KeychainReader.value)
-                defer {
-                    for index in secrets.indices {
-                        secrets[index].removeAll(keepingCapacity: false)
-                    }
-                }
-                let result = try await transport.send(
-                    profile: profile,
-                    operation: operation,
-                    method: options.method,
-                    relativePath: options.path,
-                    body: body,
-                    secrets: secrets,
-                    secretOutput: secretOutput
-                )
-                let forbiddenArtifacts = forbiddenCredentialArtifacts(profile: profile, secrets: secrets)
-                try emitJSON(result, forbiddenSecrets: forbiddenArtifacts)
-
-            default:
-                throw fail("Unknown command.\n\n" + usage(), exitCode: 2)
-            }
-        } catch let failure as SafeFailure {
-            writeError(failure.message)
-            exit(failure.exitCode)
-        } catch {
-            writeError("The operation failed safely; no credential or raw diagnostic was printed.")
-            exit(1)
-        }
+        let exitCode = await runCLI(Array(CommandLine.arguments.dropFirst()))
+        if exitCode != 0 { exit(exitCode) }
     }
 }
