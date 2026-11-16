@@ -264,6 +264,131 @@ private func readRegularFile(
     return data
 }
 
+// Opt-in response sink. Reserve a new file before credentials or network access;
+// never expose the unsanitized response through the normal output channel.
+private final class ProtectedResponseFile {
+    private let directory: Int32
+    private var descriptor: Int32
+    private let name: String
+    private var committed = false
+
+    private static func hasNoExtendedACL(_ descriptor: Int32) -> Bool {
+        errno = 0
+        guard let acl = acl_get_fd_np(descriptor, ACL_TYPE_EXTENDED) else {
+            // Darwin returns ENOENT when a valid file descriptor has no ACL.
+            return errno == ENOENT
+        }
+        defer { acl_free(UnsafeMutableRawPointer(acl)) }
+        var entry: acl_entry_t?
+        errno = 0
+        return acl_get_entry(acl, Int32(ACL_FIRST_ENTRY.rawValue), &entry) == -1 && errno == EINVAL
+    }
+
+    init(path: String) throws {
+        let parts = path.split(separator: "/", omittingEmptySubsequences: false)
+        guard path.hasPrefix("/"), !containsControlCharacters(path),
+              parts.count >= 3, parts.first == "",
+              parts.dropFirst().allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            throw fail("Secret output requires an absolute, non-traversing file path.", exitCode: 3)
+        }
+        var parent = open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC)
+        guard parent >= 0 else { throw fail("Secret output directory could not be opened.", exitCode: 3) }
+        do {
+            for part in parts.dropFirst().dropLast() {
+                let next = openat(parent, String(part), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+                guard next >= 0 else { throw fail("Secret output directory path was unsafe.", exitCode: 3) }
+                close(parent)
+                parent = next
+                var info = stat()
+                guard fstat(parent, &info) == 0,
+                      (info.st_uid == 0 || info.st_uid == geteuid()),
+                      (info.st_mode & 0o022) == 0 || (info.st_mode & S_ISVTX) != 0 else {
+                    throw fail("Secret output directory ancestry was unsafe.", exitCode: 3)
+                }
+            }
+            var parentInfo = stat()
+            guard fstat(parent, &parentInfo) == 0,
+                  parentInfo.st_uid == geteuid(), (parentInfo.st_mode & 0o077) == 0,
+                  Self.hasNoExtendedACL(parent) else {
+                throw fail("Secret output requires an owner-only directory.", exitCode: 3)
+            }
+        } catch {
+            close(parent)
+            throw error
+        }
+        let leaf = String(parts.last!)
+        let file = openat(parent, leaf, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        guard file >= 0 else {
+            close(parent)
+            throw fail("Secret output must be a new file; existing files and symlinks are refused.", exitCode: 3)
+        }
+        var info = stat()
+        guard fchmod(file, 0o600) == 0, fstat(file, &info) == 0,
+              (info.st_mode & S_IFMT) == S_IFREG, info.st_uid == geteuid(),
+              (info.st_mode & 0o777) == 0o600, info.st_nlink == 1, info.st_size == 0,
+              Self.hasNoExtendedACL(file) else {
+            close(file)
+            close(parent)
+            throw fail("Secret output file failed safety checks.", exitCode: 3)
+        }
+        directory = parent
+        descriptor = file
+        name = leaf
+    }
+
+    deinit {
+        if descriptor >= 0 { close(descriptor) }
+        close(directory)
+        // Retain even a partial/empty file on failure: the remote mutation may
+        // have succeeded. Never silently retry or delete the only response.
+    }
+
+    func commit(_ data: Data) throws -> [String: Any] {
+        guard !committed, !data.isEmpty, data.count <= maximumResponseBytes else {
+            throw fail("Secret output could not be committed; do not retry a remote mutation.", exitCode: 5)
+        }
+        var parentInfo = stat()
+        var beforeWrite = stat()
+        guard fstat(directory, &parentInfo) == 0, parentInfo.st_uid == geteuid(),
+              (parentInfo.st_mode & 0o077) == 0, Self.hasNoExtendedACL(directory),
+              fstat(descriptor, &beforeWrite) == 0, beforeWrite.st_uid == geteuid(),
+              (beforeWrite.st_mode & 0o777) == 0o600, beforeWrite.st_nlink == 1,
+              Self.hasNoExtendedACL(descriptor) else {
+            throw fail("Secret output permissions changed. Remote mutation may have succeeded; do not retry.", exitCode: 5)
+        }
+        let written = data.withUnsafeBytes { buffer -> Bool in
+            guard let base = buffer.baseAddress else { return false }
+            var offset = 0
+            while offset < buffer.count {
+                let count = Darwin.write(descriptor, base.advanced(by: offset), buffer.count - offset)
+                if count < 0 && errno == EINTR { continue }
+                guard count > 0 else { return false }
+                offset += count
+            }
+            return true
+        }
+        var fileInfo = stat()
+        var linkInfo = stat()
+        guard written, fsync(descriptor) == 0, fsync(directory) == 0,
+              fstat(descriptor, &fileInfo) == 0,
+              fstatat(directory, name, &linkInfo, AT_SYMLINK_NOFOLLOW) == 0,
+              fileInfo.st_ino == linkInfo.st_ino, fileInfo.st_dev == linkInfo.st_dev,
+              (fileInfo.st_mode & S_IFMT) == S_IFREG,
+              fileInfo.st_uid == geteuid(), (fileInfo.st_mode & 0o777) == 0o600,
+              fileInfo.st_nlink == 1, fileInfo.st_size == data.count,
+              Self.hasNoExtendedACL(descriptor), Self.hasNoExtendedACL(directory) else {
+            throw fail("Secret response persistence was not verified. Remote mutation may have succeeded; do not retry.", exitCode: 5)
+        }
+        let closeResult = close(descriptor)
+        descriptor = -1
+        guard closeResult == 0 else {
+            throw fail("Secret response close was not verified. Remote mutation may have succeeded; do not retry.", exitCode: 5)
+        }
+        committed = true
+        return ["ok": true, "secret_output_file_written": true, "secret_output": false]
+    }
+}
+
 private enum CredentialPlacement {
     case bearer
     case basic(username: String)
@@ -784,7 +909,8 @@ private final class APITransport {
         method: String,
         relativePath: String,
         body: Data?,
-        secrets: [String]
+        secrets: [String],
+        secretOutput: ProtectedResponseFile? = nil
     ) async throws -> Any {
         let url = try Self.requestURL(
             origin: profile.origin,
@@ -832,7 +958,7 @@ private final class APITransport {
         do {
             (bytes, response) = try await session.bytes(for: request)
         } catch {
-            throw fail("The API request failed before a response was received.", exitCode: 5)
+            throw fail("No API response was received. A remote mutation may have succeeded; verify state before retrying.", exitCode: 5)
         }
         guard let http = response as? HTTPURLResponse,
               let responseURL = http.url,
@@ -855,6 +981,7 @@ private final class APITransport {
         }
 
         var data = Data()
+        defer { data.resetBytes(in: 0..<data.count) }
         let expectedSize = http.expectedContentLength > 0 ? Int(http.expectedContentLength) : 0
         data.reserveCapacity(min(expectedSize, maximumResponseBytes))
         do {
@@ -867,9 +994,12 @@ private final class APITransport {
         } catch let failure as SafeFailure {
             throw failure
         } catch {
-            throw fail("The API response ended unexpectedly.", exitCode: 5)
+            throw fail("The API response ended unexpectedly. A remote mutation may have succeeded; verify state before retrying.", exitCode: 5)
         }
         if data.isEmpty && operation.response == .jsonOrEmpty {
+            guard secretOutput == nil else {
+                throw fail("No secret response was saved. A remote mutation may have succeeded; verify state before retrying.", exitCode: 5)
+            }
             return ["ok": true, "status": http.statusCode]
         }
         guard let mediaType = http.mimeType?.lowercased(),
@@ -882,6 +1012,9 @@ private final class APITransport {
         }
         guard !objectContainsAnySecret(object, secrets: forbiddenArtifacts) else {
             throw fail("The API response contained credential material.", exitCode: 5)
+        }
+        if let secretOutput {
+            return try secretOutput.commit(data)
         }
         return sanitizedAPIObject(
             object,
@@ -906,10 +1039,11 @@ private struct RequestOptions {
     let method: String
     let path: String
     let bodyFile: String?
+    let secretOutputFile: String?
 }
 
 private func parseRequestOptions(_ arguments: [String]) throws -> RequestOptions {
-    let allowed = Set(["--method", "--path", "--body-file"])
+    let allowed = Set(["--method", "--path", "--body-file", "--secret-output-file"])
     var values: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -929,7 +1063,8 @@ private func parseRequestOptions(_ arguments: [String]) throws -> RequestOptions
           !path.isEmpty else {
         throw fail("request requires --method and --path.", exitCode: 2)
     }
-    return RequestOptions(method: method, path: path, bodyFile: values["--body-file"])
+    return RequestOptions(method: method, path: path, bodyFile: values["--body-file"],
+                          secretOutputFile: values["--secret-output-file"])
 }
 
 private func operationForRequest(profile: ProfilePolicy, method: String, relativePath: String) throws -> OperationPolicy {
@@ -1091,11 +1226,50 @@ private func runSelfTest() throws {
           objectContainsAnySecret(escapedObject, secrets: [escapedMarker]) else {
         throw fail("Self-test failed: parsed-object credential tripwire.")
     }
+    try runProtectedResponseFileSelfTest()
     try emitJSON([
         "keychain_read": false,
         "network_used": false,
+        "protected_file_tests_passed": true,
         "passed": true
     ])
+}
+
+private func runProtectedResponseFileSelfTest() throws {
+    let files = FileManager.default
+    let directory = "/private/tmp/keychain-api-sink-self-test-" + UUID().uuidString
+    try files.createDirectory(atPath: directory, withIntermediateDirectories: false,
+                              attributes: [.posixPermissions: 0o700])
+    defer { try? files.removeItem(atPath: directory) }
+    let path = directory + "/response.json"
+    let marker = "INERT_PROTECTED_FILE_SELF_TEST"
+    let bytes = try JSONSerialization.data(withJSONObject: ["result": ["client_secret": marker]])
+    let sink = try ProtectedResponseFile(path: path)
+    let receipt = try sink.commit(bytes)
+    guard try readRegularFile(at: path, maximumBytes: 4096, requirePrivateMode: true) == bytes,
+          try encodedJSON(receipt).range(of: Data(marker.utf8)) == nil else {
+        throw fail("Self-test failed: protected file bytes or receipt.")
+    }
+    func requireRefusal(_ action: () throws -> Void) throws {
+        do { try action() } catch is SafeFailure { return }
+        throw fail("Self-test failed: unsafe secret file was accepted.")
+    }
+    try requireRefusal { _ = try ProtectedResponseFile(path: path) }
+    try requireRefusal { _ = try sink.commit(bytes) }
+    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/../unsafe.json") }
+    try requireRefusal { _ = try ProtectedResponseFile(path: "relative.json") }
+    try files.createSymbolicLink(atPath: directory + "/link.json", withDestinationPath: path)
+    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/link.json") }
+    try files.createSymbolicLink(atPath: directory + "/linked-directory", withDestinationPath: directory)
+    try requireRefusal { _ = try ProtectedResponseFile(path: directory + "/linked-directory/new.json") }
+    let publicDirectory = directory + "/not-private"
+    try files.createDirectory(atPath: publicDirectory, withIntermediateDirectories: false,
+                              attributes: [.posixPermissions: 0o755])
+    guard chmod(publicDirectory, 0o755) == 0 else { throw fail("Self-test fixture setup failed.") }
+    try requireRefusal { _ = try ProtectedResponseFile(path: publicDirectory + "/new.json") }
+    guard try readRegularFile(at: path, maximumBytes: 4096, requirePrivateMode: true) == bytes else {
+        throw fail("Self-test failed: existing secret file was modified.")
+    }
 }
 
 private func usage() -> String {
@@ -1103,8 +1277,13 @@ private func usage() -> String {
     Usage:
       keychain-api status <profile>
       keychain-api authorize <profile>
-      keychain-api request <profile> --method <METHOD> --path <PATH> [--body-file <JSON_FILE>]
+      keychain-api request <profile> --method <METHOD> --path <PATH> [--body-file <JSON_FILE>] [--secret-output-file <NEW_JSON_FILE>]
       keychain-api self-test
+
+    Secret output: requires a NEW file in an existing owner-only directory.
+    Saves the JSON response directly as mode 0600; prints only a fixed receipt.
+    Existing files, symlinks, and traversal are refused. Never retry a timed-out
+    mutation without checking provider state. Default output is unchanged.
 
     Policy: ~/.config/codex/keychain-api.json
     """
@@ -1199,6 +1378,11 @@ private enum KeychainAPICLI {
                     throw fail("The request body does not match policy.", exitCode: 2)
                 }
 
+                guard options.secretOutputFile == nil || operation.response != .empty else {
+                    throw fail("Secret output requires a JSON response policy.", exitCode: 2)
+                }
+                let secretOutput = try options.secretOutputFile.map { try ProtectedResponseFile(path: $0) }
+
                 var secrets = try profile.credentials.map(KeychainReader.value)
                 defer {
                     for index in secrets.indices {
@@ -1212,7 +1396,8 @@ private enum KeychainAPICLI {
                     method: options.method,
                     relativePath: options.path,
                     body: body,
-                    secrets: secrets
+                    secrets: secrets,
+                    secretOutput: secretOutput
                 )
                 let forbiddenArtifacts = forbiddenCredentialArtifacts(profile: profile, secrets: secrets)
                 try emitJSON(result, forbiddenSecrets: forbiddenArtifacts)

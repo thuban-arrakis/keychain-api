@@ -1,6 +1,6 @@
 # keychain-api
 
-`keychain-api` is a policy-constrained HTTPS client for macOS. It reads an API credential from the login Keychain, places it in an approved request header, and emits a sanitized JSON response without printing the credential or putting it in a process argument.
+`keychain-api` is a policy-constrained HTTPS client for macOS. It reads an API credential from the login Keychain and places it in an approved request header without printing it or putting it in a process argument. By default, it emits a sanitized JSON response; an explicit protected-file option can save a sensitive JSON response without printing that response.
 
 The executable is intentionally narrow. Every profile fixes the destination origin, authentication placement, allowed HTTP methods and paths, request-body policy, and response type.
 
@@ -170,13 +170,53 @@ The example origin is intentionally non-routable. Replace it with the exact trus
 
 ## Output behavior
 
-Successful responses are emitted as formatted JSON. The client rejects unsafe redirects, origin changes, unexpected media types, non-2xx responses, invalid JSON, and responses that contain the credential or recognizable credential material. Errors are deliberately terse to reduce accidental disclosure.
+By default, successful responses are emitted as formatted, sanitized JSON. The client rejects unsafe redirects, origin changes, unexpected media types, non-2xx responses, invalid JSON, and responses containing the configured request credentials. Recognized sensitive fields and credential-shaped values are redacted from normal output. Errors are deliberately terse to reduce accidental disclosure. Redaction is defense in depth: arbitrary free-form response content is not guaranteed safe to print.
+
+### Opt-in protected JSON file
+
+Use `--secret-output-file` when an authorized API operation returns a sensitive response that must not appear in terminal output. It uses the same transport and reusable policy profile; it does not require a provider-specific helper, change authentication, or expand the allowed origin, methods, or paths. The example profile targets the reserved origin `https://api.example.invalid`.
+
+```sh
+response_dir="$(mktemp -d /private/tmp/keychain-api-response.XXXXXX)"
+keychain-api request example-api \
+  --method POST \
+  --path '/v1/items' \
+  --body-file examples/request-body.json \
+  --secret-output-file "$response_dir/response.json"
+```
+
+The helper reserves a new file before reading Keychain credentials or making a network request. It requires:
+
+- An absolute path without traversal, repeated separators, or symlinks in any component. On macOS, use `/private/tmp` rather than the `/tmp` symlink.
+- An existing directory owned by the current user, with no group/other permissions or extended ACL entries; mode `0700` is appropriate. Ancestors must be owned by root or the current user and must not be group/other writable unless sticky.
+- A new regular output file, created exclusively with mode `0600`, owned by the current user, with one hard link and no extended ACL entries. Existing files are never overwritten.
+- A `json` or `json-or-empty` response policy and a nonempty valid JSON response. An empty response is not a successful secret-file write.
+
+The file contains the **entire JSON response**, before normal output redaction, not just a selected token field. Responses echoing the configured request credentials are still rejected. Successful persistence prints only this fixed receipt; no response fields or file contents are printed:
+
+```json
+{
+  "ok": true,
+  "secret_output": false,
+  "secret_output_file_written": true
+}
+```
+
+Here, `secret_output: false` means the secret was not emitted to standard output, not that the file lacks secrets. Without the option, normal response output is unchanged.
+
+The saved file is **plaintext**, not an encrypted store or a Keychain item. Permissions do not protect it from root or other processes running as the same user. Keep it outside repositories and shared/synced directories; do not print it, attach it to reports, or pass its contents in command arguments. After secure delivery to the intended consumer, remove the exact file when it is no longer needed; deletion is not a guarantee of secure erasure or removal from backups.
+
+An error can leave an empty, partial, or complete file, which is deliberately retained. File existence does not prove successful persistence, and a missing success receipt does not prove that a remote mutation failed. Do not automatically retry a timeout, interrupted response, or persistence error. Check remote state without exposing secrets before deciding on recovery or another request.
+
+### Offline self-test
 
 `self-test` performs no Keychain read and no network request:
 
 ```sh
 keychain-api self-test
 ```
+
+It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
 
 ## Exit codes
 
@@ -185,9 +225,9 @@ keychain-api self-test
 | `0` | Success |
 | `1` | Safe fallback for an unexpected failure |
 | `2` | Invalid command, arguments, or unknown profile |
-| `3` | Invalid policy or local JSON input |
+| `3` | Invalid policy, local JSON input, or protected-file destination |
 | `4` | Keychain lookup or authorization failure |
-| `5` | HTTPS transport or API response failure |
+| `5` | HTTPS transport, API response, or secret-response persistence failure |
 
 ## Limitations
 
