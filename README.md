@@ -1,6 +1,6 @@
 # keychain-api
 
-`keychain-api` is a policy-constrained HTTPS client for macOS. It reads an API credential from the login Keychain and places it in an approved request header without printing it or putting it in a process argument. By default, it emits a sanitized JSON response; an explicit protected-file option can save a sensitive JSON response without printing that response.
+`keychain-api` is a policy-constrained credential client for macOS. Its HTTPS transport reads an API credential from the login Keychain and places it in an approved request header without printing it or putting it in a process argument. By default, it emits a sanitized JSON response; an explicit protected-file option can save a sensitive JSON response without printing that response. A separate 1Password adapter runs policy-approved service account commands through the official CLI, saving their output to protected files.
 
 The executable is intentionally narrow. Every profile fixes the destination origin, authentication placement, allowed HTTP methods and paths, request-body policy, and response type.
 
@@ -10,7 +10,7 @@ The executable is intentionally narrow. Every profile fixes the destination orig
 - Xcode Command Line Tools with Swift 5.9 and the macOS 14 SDK or newer
 - A generic-password item in the default login Keychain
 
-The current source has no third-party dependencies. It uses Foundation, Security, LocalAuthentication, and Network.
+The Swift source has no third-party dependencies. It uses Foundation, Security, LocalAuthentication, and Network. The optional 1Password adapter requires the official 1Password CLI.
 
 ## Build
 
@@ -106,8 +106,10 @@ Do not overwrite an existing policy without reviewing and preserving its profile
 Each credential entry references a macOS generic-password item by `service` and `account`:
 
 - `bearer`: sends `Authorization: Bearer <credential>`.
+- `api-key`: sends `Authorization: APIKey <credential>`.
 - `basic`: requires a policy `username` and sends HTTP Basic authentication.
 - `header`: requires an allowed custom `header` and accepts an optional `prefix`.
+- `onepassword-service-account`: authenticates the policy-controlled CLI adapter described below; it cannot send the token as an HTTP header.
 
 The actual password or token must never appear in the JSON policy.
 
@@ -120,7 +122,73 @@ An operation uses either:
 
 Supported methods are `GET`, `HEAD`, `POST`, `PUT`, `PATCH`, and `DELETE`. Body policies are `none`, `json`, and `optional-json`. Response policies are `json`, `empty`, and `json-or-empty`.
 
-Origins must use HTTPS. Redirects are refused, TLS 1.2 or newer is required, request bodies are limited to 1 MiB, and responses are limited to 8 MiB.
+Origins must use HTTPS. For HTTP profiles, redirects are refused, TLS 1.2 or newer is required, request bodies are limited to 1 MiB, and responses are limited to 8 MiB. The 1Password adapter delegates its authenticated connection to the official CLI.
+
+### 1Password service account commands
+
+Download the macOS CLI from [1Password's installation instructions](https://www.1password.dev/cli/get-started) and follow its [authenticity verification instructions](https://www.1password.dev/cli/verify). Install the verified executable at the adapter's fixed location:
+
+```sh
+mkdir -p "$HOME/.local/share/keychain-api"
+chmod 0700 "$HOME/.local/share/keychain-api"
+install -m 0700 /path/to/verified/op "$HOME/.local/share/keychain-api/op"
+```
+
+Before reading the credential, the helper checks that the CLI is a regular, current-user-owned private file and verifies its Apple-anchored signature against 1Password's team identifier. Symlink executables are refused.
+
+Add a profile to your private policy, replacing the example origin and Keychain references with your own values:
+
+```json
+"onepassword-api": {
+  "origin": "https://your-team.1password.com",
+  "credentials": [
+    {
+      "service": "com.example.keychain-api.onepassword",
+      "account": "service-account",
+      "type": "onepassword-service-account"
+    }
+  ],
+  "operations": [],
+  "op_commands": [
+    "whoami", "read", "user get", "user list", "group get", "group list",
+    "item template list", "item template get", "item list", "item get",
+    "item create", "item edit", "item delete", "item move", "item share",
+    "vault list", "vault get", "vault create", "vault delete",
+    "vault group list", "vault group grant", "vault group revoke",
+    "vault user list", "vault user grant", "vault user revoke",
+    "document list", "document get", "document create", "document edit", "document delete",
+    "service-account ratelimit", "environment secret list"
+  ]
+}
+```
+
+`op_commands` contains exact CLI command names. Choose only the capabilities the profile needs; additional commands under supported API command families can be enabled in policy without changing the executable. Local execution, shell injection, plugin, updater, and session-management commands are excluded. This allowlist controls credential delivery, not authorization to perform a particular mutation. 1Password still enforces the service account's permissions and [supported command limitations](https://www.1password.dev/service-accounts/use-with-1password-cli).
+
+A 1Password profile has exactly one credential and cannot use a SOCKS proxy. The token's embedded sign-in destination must match the policy's exact HTTPS hostname under `1password.com`, `1password.eu`, or `1password.ca`; custom ports and URL credentials, paths, queries, or fragments are refused. After an account URL changes, [rotate the service account token as required by 1Password](https://support.1password.com/change-sign-in-address/), store the replacement in Keychain, and update the private profile. The helper does not rewrite token contents or bypass destination validation.
+
+```sh
+keychain-api status onepassword-api
+keychain-api authorize onepassword-api
+
+response_dir="$(mktemp -d /private/tmp/keychain-api-response.XXXXXX)"
+keychain-api op onepassword-api \
+  --command 'vault list' \
+  --secret-output-file "$response_dir/vaults.json"
+```
+
+Every `op` call requires a new `--secret-output-file`, including list operations whose names or metadata may be sensitive. JSON responses are preserved privately. Plaintext secret reads, document downloads, and other non-JSON output use a JSON envelope with `encoding: "base64"` and `data`. Empty successful output becomes `{"ok": true}`. Only the fixed file-write receipt is printed. Authentication-token echoes are refused.
+
+For command arguments, supply `--args-file` referencing a private JSON array of **non-secret** strings. For example, item lookup arguments can be `["ITEM_ID", "--vault", "VAULT_ID", "--reveal"]`. Use full, split option names. The helper rejects shell-style field assignments, stdin markers, short options, authentication/configuration overrides, arbitrary URLs, and direct input/output file flags. Secret references beginning with `op://` are accepted for `read`. Never put secret values in this argument array: its values become CLI process arguments.
+
+For item creation or edits, supply the private JSON item template through `--input-file`. For document creation or edits, use `--input-file` for the document bytes. The helper makes a private temporary copy and passes only its path to the CLI. Document edits require the item ID/name as the first argument; optional metadata flags are `--vault`, `--title`, `--tags`, and `--file-name`. Other commands cannot accept an input file. Secret-bearing flags such as `--value`, `--password`, and `--notes` are refused; this adapter does not provide arbitrary CLI passthrough.
+
+Both input files and argument files must be regular files owned by the current user, without group/other permissions or extended ACLs, inside owner-only directories. Symlinks in any path component and hard-linked input files are rejected. Input is parsed as data and never executed. Item templates and argument files are limited to 1 MiB; document inputs and CLI output are limited to 8 MiB. The final stored JSON is also limited to 8 MiB, so base64-wrapped binary content has a lower effective payload limit.
+
+The helper supplies the token only in the CLI child's environment. It does not inherit proxy, session, alternate-account, debug, or TLS override variables. The CLI uses a private temporary configuration directory with caching disabled; the directory and copied input are removed when the command returns. An abrupt termination can leave that directory behind. Commands terminate after 40 seconds, with a forced stop after 45 seconds if necessary. Raw diagnostics are suppressed. A failed or timed-out mutation is indeterminate: inspect remote state before retrying. Output files are reserved before authentication and retained on failure as recovery evidence.
+
+The original identity check remains available for existing profiles whose `operations` explicitly permit `GET /user/me`. It maps to `op user get --me` and prints only authentication, service account type, and an enumerated state. It is a compatibility route, not a public REST endpoint or a restriction on `op_commands`. An `ACTIVE` result does not establish administrator privileges or access to every vault.
+
+Keep runtime policies, account URLs, Keychain contents, CLI binaries, and test responses outside Git. Only reusable source, inert tests, and generic documentation belong in this repository.
 
 ### Optional SOCKS proxy
 
@@ -150,7 +218,7 @@ security add-generic-password \
   -w
 ```
 
-The `account` and `service` values must match the selected policy profile. Never pass a credential directly after `-w`, store it in an environment variable, or place it in shell history.
+The `account` and `service` values must match the selected policy profile. Never pass a credential directly after `-w`, export it in your shell environment, or place it in shell history. The 1Password adapter manages the required child-only environment internally.
 
 ## Usage
 
@@ -187,7 +255,7 @@ The example origin is intentionally non-routable. Replace it with the exact trus
 
 ## Output behavior
 
-By default, successful responses are emitted as formatted, sanitized JSON. The client rejects unsafe redirects, origin changes, unexpected media types, non-2xx responses, invalid JSON, and responses containing the configured request credentials. Recognized sensitive fields and credential-shaped values are redacted from normal output. Errors are deliberately terse to reduce accidental disclosure. Redaction is defense in depth: arbitrary free-form response content is not guaranteed safe to print.
+For HTTP profiles, successful responses are emitted as formatted, sanitized JSON. The client rejects unsafe redirects, origin changes, unexpected media types, non-2xx responses, invalid JSON, and responses containing the configured request credentials. Recognized sensitive fields and credential-shaped values are redacted from normal output. Errors are deliberately terse to reduce accidental disclosure. Redaction is defense in depth: arbitrary free-form response content is not guaranteed safe to print. The 1Password adapter emits a protected-file receipt, or the fixed identity summary for its compatibility route.
 
 ### Opt-in protected JSON file
 
@@ -233,7 +301,7 @@ An error can leave an empty, partial, or complete file, which is deliberately re
 keychain-api self-test
 ```
 
-It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged, validates proxy policy, and verifies that supported proxy sessions disable direct fallback. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
+It uses inert fixtures to check response redaction and policy validation, protected-file contents and receipt isolation, refusal of existing files, repeated commits, relative/traversing paths, symlink files/directories, and nonprivate directories. It also checks that an existing file remains unchanged, validates proxy policy, and verifies that supported proxy sessions disable direct fallback. Authentication checks cover supported HTTP header schemes, conflicting credentials, 1Password destination mismatches, attempts to send a service account token as an HTTP header, command allowlists, unsafe argument overrides, protected input checks, binary response preservation, and an inert subprocess lifecycle test. These checks are not a formal security audit and do not simulate every filesystem, race, or transport failure.
 
 ## Exit codes
 
@@ -249,8 +317,9 @@ It uses inert fixtures to check response redaction and policy validation, protec
 ## Limitations
 
 - macOS only.
-- JSON APIs only.
-- No redirects, cookies, streaming responses, or arbitrary request headers.
+- JSON APIs and policy-approved 1Password CLI service account operations only.
+- The HTTP transport has no redirects, cookies, streaming responses, or arbitrary request headers.
+- 1Password capabilities depend on the installed CLI and service account permissions. Local process-execution commands and secret-bearing command arguments are excluded. Its child environment is not protected from root or other processes running as the same user.
 - Explicit proxy support is limited to a loopback SOCKSv5 listener on macOS 14 or newer.
 - Response redaction is defense in depth, not a substitute for a narrowly scoped policy and API credential.
 
