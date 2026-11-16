@@ -34,11 +34,15 @@ make debug
 make release
 make test
 make test CONFIGURATION=debug
+make version
 make verify
+make dist
 make install PREFIX="$HOME/.local"
 ```
 
-`make test` runs the self-test in `CONFIGURATION` (release by default). `make verify` applies and verifies an ad hoc hardened-runtime signature. Set `CODESIGN_IDENTITY` and `CODESIGN_IDENTIFIER` to use a different signing identity and identifier. `make install` signs and installs the executable with mode `0700`.
+`make test` runs the self-test in `CONFIGURATION` (release by default). `make version` builds in that configuration and prints the compiled version. `make verify` strips debug and local symbols, then applies and verifies an ad hoc hardened-runtime signature. Set `CODESIGN_IDENTITY` and `CODESIGN_IDENTIFIER` to use a different signing identity and identifier. `make install` signs and installs the executable with mode `0700`.
+
+`make dist` packages the verified release binary and writes its archive and SHA-256 checksum to `dist/`. The filename includes the compiled version and actual binary architecture: `keychain-api-<version>-macos-<architecture>.tar.gz`. Each archive contains only `keychain-api`, with neutral owner/group metadata and no macOS metadata or extended attributes. Packaging accepts a single `arm64` or `x86_64` architecture; it does not build the other architecture automatically.
 
 A rebuilt executable can trigger a new macOS Keychain authorization prompt because Keychain access control is tied to the requesting binary.
 
@@ -62,7 +66,7 @@ xcrun swiftc \
   -framework LocalAuthentication \
   -framework Network \
   -o build/keychain-api
-strip -x build/keychain-api
+strip -S -x build/keychain-api
 codesign --force --sign - --options runtime \
   --identifier local.keychain-api \
   build/keychain-api
@@ -96,9 +100,36 @@ The files in `Sources/KeychainAPI` form one executable target:
 | `ProtectedFiles.swift` | Private input and durable response files |
 | `JSONSafety.swift` | Credential detection, JSON validation, and redaction |
 | `Support.swift` | Shared errors, limits, and metadata checks |
+| `Version.swift` | Compiled release version |
 | `SelfTests.swift` | Offline checks run by `keychain-api self-test` |
 | `CLISelfTests.swift` | Command dispatch, refusal ordering, and output checks |
 | `HTTPTransportSelfTests.swift` | Deterministic HTTP response and recovery checks |
+
+### Versions and releases
+
+`keychain-api --version` prints the version alone and exits without reading policy or Keychain data. [Version.swift](Sources/KeychainAPI/Version.swift) is the only version source for Swift Package Manager and direct compiler builds. Change `ReleaseVersion.current` for a new release; archive filenames and tags are derived from the built executable.
+
+Versions use `MAJOR.MINOR.PATCH`. Before `1.0.0`, increment the minor version for new capabilities or incompatible CLI/policy changes, and the patch version for compatible fixes. Do not move published tags or replace release assets; corrections get a new version.
+
+After the release changes have landed as one signed squash commit, run the following from a clean checkout of the published `main` commit. The local signing key must be configured for Git, and the GitHub CLI must be authenticated:
+
+```sh
+make test
+make dist
+binary="$(swift build --configuration release --show-bin-path)/keychain-api"
+version="$("$binary" --version)"
+tag="v$version"
+git tag --sign "$tag" --message "Release $tag"
+git tag --verify "$tag"
+git push origin "$tag"
+gh release create "$tag" --verify-tag --title "$tag" --generate-notes \
+  dist/keychain-api-"$version"-macos-*.tar.gz \
+  dist/keychain-api-"$version"-macos-*.tar.gz.sha256
+```
+
+The signed tag identifies the source commit; `--verify-tag` prevents GitHub from creating a tag implicitly. GitHub supplies source archives separately. Binary assets are labeled by architecture, so an Apple silicon build does not imply an Intel or universal binary. Check an archive against its adjacent `.sha256` file with `shasum -a 256 -c` before extracting it.
+
+The default executable signature is **ad hoc**, not a Developer ID signature, and the binary is not notarized. Git commit/tag GPG signatures and archive checksums are separate from macOS executable signing. A checksum verifies downloaded bytes; it is not a substitute for a trusted release source.
 
 ## Policy
 

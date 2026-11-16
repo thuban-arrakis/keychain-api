@@ -68,6 +68,7 @@ func operationForRequest(profile: ProfilePolicy, method: String, relativePath: S
 private func usage() -> String {
     """
     Usage:
+      keychain-api --version
       keychain-api status <profile>
       keychain-api authorize <profile>
       keychain-api request <profile> --method <METHOD> --path <PATH> [--body-file <JSON_FILE>] [--secret-output-file <NEW_JSON_FILE>]
@@ -204,6 +205,9 @@ private func handleRequest(_ arguments: [String], dependencies: CLIDependencies)
 private func dispatchCLI(_ arguments: [String], dependencies: CLIDependencies) async throws {
     guard let command = arguments.first else { throw fail(usage(), exitCode: 2) }
     switch command {
+    case "--version":
+        guard arguments.count == 1 else { throw fail("--version accepts no arguments.", exitCode: 2) }
+        dependencies.stdout(Data((ReleaseVersion.current + "\n").utf8))
     case "help", "--help", "-h":
         guard arguments.count == 1 else { throw fail("help accepts no arguments.", exitCode: 2) }
         dependencies.stdout(Data((usage() + "\n").utf8))

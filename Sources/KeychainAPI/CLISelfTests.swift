@@ -23,7 +23,37 @@ private func checkCLIRefusal(_ result: CLIInvocation, exitCode: Int32) throws {
                  "refusal before credential or subprocess access")
 }
 
+private func checkCLIVersion() async throws {
+    for arguments in [["--version"], ["--version", "extra"], ["--verion"]] {
+        var stdout = Data()
+        var stderr = Data()
+        var externalCalls = 0
+        func unexpectedAccess() -> SafeFailure {
+            externalCalls += 1
+            return fail("Version command accessed an external dependency.")
+        }
+        let dependencies = CLIDependencies(
+            loadPolicy: { throw unexpectedAccess() },
+            credentialExists: { _ in throw unexpectedAccess() },
+            credentialValue: { _ in throw unexpectedAccess() },
+            authorizeCredential: { _, _ in throw unexpectedAccess() },
+            onePasswordExecutable: { throw unexpectedAccess() },
+            stdout: { stdout.append($0) },
+            stderr: { stderr.append($0) }
+        )
+        let result = await runCLI(arguments, dependencies: dependencies)
+        if arguments == ["--version"] {
+            try checkCLI(result == 0 && stdout == Data((ReleaseVersion.current + "\n").utf8) && stderr.isEmpty,
+                         "version output")
+        } else {
+            try checkCLI(result == 2 && stdout.isEmpty && !stderr.isEmpty, "version argument refusal")
+        }
+        try checkCLI(externalCalls == 0, "version must not access policy, credentials, or subprocesses")
+    }
+}
+
 func runCLISelfTests() async throws {
+    try await checkCLIVersion()
     let files = FileManager.default
     let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
         .appendingPathComponent("keychain-cli-test-" + UUID().uuidString, isDirectory: true)
