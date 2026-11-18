@@ -11,178 +11,18 @@ private func expectFailure(_ label: String, exitCode: Int32? = nil, _ action: ()
     throw fail("Self-test failed: expected refusal for " + label + ".")
 }
 
-private func runOnePasswordSelfTest() throws {
-    let origin = URL(string: "https://team.1password.com")!
-    func fixture(_ address: String) throws -> String {
-        let bytes = try JSONSerialization.data(withJSONObject: ["signInAddress": address])
-        return "ops_" + bytes.base64EncodedString().replacingOccurrences(of: "+", with: "-")
-            .replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
-    }
-    try validateOnePasswordTokenOrigin(fixture("team.1password.com"), expected: origin)
-    for address in ["other.1password.com", "team.1password.com.evil.invalid", "http://team.1password.com",
-                    "team.1password.com:443", "team.1password.com/path", "user@team.1password.com",
-                    "team.1password.com?query=x", "team.1password.com#fragment"] {
-        try expectFailure("1Password input") { try validateOnePasswordTokenOrigin(fixture(address), expected: origin) }
-    }
-    try expectFailure("1Password input") { _ = try CredentialPlacement.onePasswordServiceAccount.requestHeader(secret: "INERT") }
-    let credential: [String: Any] = ["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]
-    let commands = ["whoami", "vault list", "item create", "document get", "vault group grant", "read"]
-    let profile: [String: Any] = ["origin": origin.absoluteString, "credentials": [credential],
-                                  "operations": commands.map { ["command": $0] }]
-    let cliProfile = try parseProfile(name: "test", dictionary: profile)
-    guard cliProfile.operations.permits(command: "item create"), !cliProfile.operations.permits(command: "item delete") else {
-        throw fail("Self-test failed: native CLI operation allowlist.")
-    }
-    for command in ["run", "inject", "signin", "update", "plugin run", "vault", "item template", "item get --debug"] {
-        var invalid = profile; invalid["operations"] = [["command": command]]
-        try expectFailure("unsupported CLI operation", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: invalid) }
-    }
-    let httpOperation: [String: Any] = ["method": "GET", "path": "/v1/status", "body": "none", "response": "json"]
-    for operations: [Any] in [[], [["command": "whoami"], ["command": "whoami"]], [httpOperation],
-                              [["command": "whoami", "method": "GET"]], [["command": "whoami"], httpOperation]] {
-        var invalid = profile; invalid["operations"] = operations
-        try expectFailure("invalid or mixed CLI operations", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: invalid) }
-    }
-    var obsolete = profile; obsolete["op_commands"] = commands
-    try expectFailure("obsolete parallel command policy", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: obsolete) }
-    var httpProfile = profile
-    httpProfile["credentials"] = [["service": "inert.test", "account": "inert", "type": "bearer"]]
-    try expectFailure("CLI operations on HTTP profile", exitCode: 3) { _ = try parseProfile(name: "test", dictionary: httpProfile) }
-    try expectFailure("HTTP dispatch on CLI profile", exitCode: 2) {
-        _ = try operationForRequest(profile: cliProfile, method: "GET", relativePath: "/v1/status")
-    }
-    try validateOnePasswordArguments(["item-id", "--vault", "vault-id", "--reveal"], command: "item get")
-    try validateOnePasswordArguments(["--generate-password=letters,digits,32", "--favorite=false"], command: "item create")
-    try validateOnePasswordArguments(["op://vault/item/field?attribute=otp"], command: "read")
-    for arguments in [["--session", "INERT"], ["--debug"], ["--config=/tmp"], ["-o", "output"],
-                      ["--out-file", "output"], ["--template", "input"], ["field=INERT"], ["-"],
-                      ["--value", "INERT"], ["--session=INERT"], ["--template=input"],
-                      ["--value=INERT"], ["https://example.invalid"], ["--", "--debug"]] {
-        try expectFailure("1Password input") { try validateOnePasswordArguments(arguments, command: "item get") }
-    }
-    _ = try prepareOnePasswordInput(Data("{}".utf8), command: "item create", arguments: [])
-    _ = try prepareOnePasswordInput(Data(), command: "document create", arguments: ["--vault", "vault-id"])
-    _ = try prepareOnePasswordInput(Data(), command: "document create", arguments: ["--vault=vault-id", "--tags="])
-    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(nil, command: "document create", arguments: ["/private/file"]) }
-    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data(), command: "document edit", arguments: []) }
-    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data("[]".utf8), command: "item create", arguments: []) }
-    try expectFailure("1Password input") { _ = try prepareOnePasswordInput(Data("{}".utf8), command: "item list", arguments: []) }
-    let fixtureBytes = Data([0, 255, 10])
-    let envelope = try onePasswordProtectedResponse(fixtureBytes, command: "document get", token: "INERT_AUTH")
-    guard let object = try JSONSerialization.jsonObject(with: envelope) as? [String: String],
-          object["encoding"] == "base64", Data(base64Encoded: object["data"] ?? "") == fixtureBytes else {
-        throw fail("Self-test failed: binary response preservation.")
-    }
-    try expectFailure("1Password input") { _ = try onePasswordProtectedResponse(Data("INERT_AUTH".utf8), command: "read", token: "INERT_AUTH") }
-    try expectFailure("truncated CLI JSON credential echo", exitCode: 5) {
-        _ = try onePasswordProtectedResponse(Data(#"{"value":"INERT_\u0041UTH""#.utf8),
-                                             command: "item create", token: "INERT_AUTH")
-    }
-    for encoded in [#"{"value":"INERT_\u0041UTH"}"#, #""INERT_\u0041UTH""#,
-                    #"{"value":"safe","value":"INERT_\u0041UTH"}"#,
-                    #"{"value":"INERT_\u0041UTH","value":"safe"}"#,
-                    #"{"value":"safe","\u0076alue":"INERT_\u0041UTH"}"#] {
-        for command in ["item get", "read"] {
-            try expectFailure("escaped CLI credential echo", exitCode: 5) {
-                _ = try onePasswordProtectedResponse(Data(encoded.utf8), command: command, token: "INERT_AUTH")
-            }
-        }
-    }
-
-    let files = FileManager.default
-    let directory = URL(fileURLWithPath: "/private/tmp", isDirectory: true)
-        .appendingPathComponent("keychain-op-test-" + UUID().uuidString, isDirectory: true)
-    try files.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
-    defer { try? files.removeItem(at: directory) }
-    let inputPath = directory.appendingPathComponent("private.json").path
-    _ = try ProtectedResponseFile(path: inputPath).commit(Data("[]".utf8))
-    guard try readProtectedInput(at: inputPath, maximumBytes: 1024) == Data("[]".utf8) else {
-        throw fail("Self-test failed: private input read.")
-    }
-    try files.createSymbolicLink(atPath: directory.appendingPathComponent("link").path, withDestinationPath: inputPath)
-    try expectFailure("1Password input") { _ = try readProtectedInput(at: directory.appendingPathComponent("link").path, maximumBytes: 1024) }
-    guard chmod(inputPath, 0o644) == 0 else { throw fail("Self-test fixture setup failed.") }
-    try expectFailure("1Password input") { _ = try readProtectedInput(at: inputPath, maximumBytes: 1024) }
-
-    // Exercise subprocess launch/collection with an inert local executable, not a real account.
-    let executable = directory.appendingPathComponent("fixture")
-    let template = Data(#"{"title":"INERT_PRIVATE_INPUT"}"#.utf8)
-    let expectedInput = directory.appendingPathComponent("expected-input")
-    try template.write(to: expectedInput)
-    let script = """
-    #!/bin/sh
-    [ "$1" = '--config' ] || exit 20
-    [ "$OP_DEBUG:$OP_CACHE:$OP_BIOMETRIC_UNLOCK_ENABLED" = 'false:false:false' ] || exit 21
-    [ -z "${OP_CONNECT_HOST+x}${OP_CONNECT_TOKEN+x}${OP_SESSION+x}${HTTPS_PROXY+x}" ] || exit 22
-    [ "$(/usr/bin/stat -f %Lp "$2")" = '700' ] || exit 23
-    case "$*" in *INERT_PRIVATE_INPUT*) exit 24;; esac
-    case "$6 $7" in
-      'item create') [ "$8" = '--template' ] && [ "$9" = "$2/input" ] || exit 25;;
-      'document create') [ "$8" = "$2/input" ] || exit 25;;
-      'document edit') [ "$8" = 'item-id' ] && [ "$9" = "$2/input" ] || exit 25;;
-      'user get') ;;
-      *) exit 25;;
-    esac
-    if [ "$6" != 'user' ]; then
-      [ -f "$2/input" ] || exit 26
-      [ "$(/usr/bin/stat -f %Lp "$2/input")" = '600' ] || exit 25
-      /usr/bin/cmp -s "$2/input" '\(expectedInput.path)' || exit 26
-    fi
-    printf '{"type":"SERVICE_ACCOUNT","state":"ACTIVE","temporary_path":"%s"}\\n' "$2"
-    """
-    try Data(script.utf8).write(to: executable)
-    guard chmod(executable.path, 0o700) == 0 else { throw fail("Self-test fixture setup failed.") }
-    let output = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
-                                          executable: executable, command: "user get", arguments: ["--me"])
-    guard let identity = try JSONSerialization.jsonObject(with: output.requireSuccess()) as? [String: Any],
-          identity["type"] as? String == "SERVICE_ACCOUNT" else {
-        throw fail("Self-test failed: CLI process lifecycle.")
-    }
-    for (command, arguments) in [("item create", [String]()), ("document create", []), ("document edit", ["item-id"])] {
-        let input = try prepareOnePasswordInput(template, command: command, arguments: arguments)
-        let result = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
-                                              executable: executable, command: command, arguments: arguments, input: input)
-        guard let object = try JSONSerialization.jsonObject(with: result.requireSuccess()) as? [String: Any],
-              let temporaryPath = object["temporary_path"] as? String,
-              !files.fileExists(atPath: temporaryPath) else {
-            throw fail("Self-test failed: private CLI input delivery or cleanup.")
-        }
-    }
-    try Data((script + "\nprintf INERT_STDERR >&2\nexit 7\n").utf8).write(to: executable)
-    let failed = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
-                                          executable: executable, command: "item create", arguments: [], input: .template(template))
-    let recoveryPath = directory.appendingPathComponent("failed-response.json").path
-    try expectFailure("failed CLI output recovery", exitCode: 5) {
-        _ = try saveOnePasswordResult(failed, command: "item create", token: "INERT_AUTH",
-                                     output: ProtectedResponseFile(path: recoveryPath))
-    }
-    guard failed.failure != nil, failed.data.range(of: Data("INERT_STDERR".utf8)) == nil,
-          try readProtectedInput(at: recoveryPath, maximumBytes: 4096) == failed.data,
-          let failedObject = try JSONSerialization.jsonObject(with: failed.data) as? [String: Any],
-          let failedTemporaryPath = failedObject["temporary_path"] as? String,
-          !files.fileExists(atPath: failedTemporaryPath) else {
-        throw fail("Self-test failed: failed CLI output was lost or temporary data was retained.")
-    }
-    try Data((script + "\ntrap 'exit 0' TERM\nwhile :; do :; done\n").utf8).write(to: executable)
-    let expired = try runOnePasswordCommand(profile: cliProfile, token: fixture("team.1password.com"),
-                                           executable: executable, command: "user get", arguments: ["--me"], timeoutSeconds: 1)
-    try expectFailure("deadline despite graceful subprocess exit", exitCode: 5) { _ = try expired.requireSuccess() }
-    guard !expired.data.isEmpty else { throw fail("Self-test failed: timeout response capture.") }
-}
-
 func runSelfTest() async throws {
     try runOperationPolicySelfTests()
     try await runCLISelfTests()
     try await runHTTPTransportSelfTests()
-    try runOnePasswordSelfTest()
     let marker = "INERT_AUTH_SELF_TEST"
     let authFixture: [String: Any] = [
         "service": "inert.test", "account": "inert", "type": "api-key"
     ]
     let apiKey = try parseCredential(authFixture).placement.requestHeader(secret: marker)
-    let bearer = try CredentialPlacement.bearer.requestHeader(secret: marker)
-    let basic = try CredentialPlacement.basic(username: "inert").requestHeader(secret: marker)
-    let custom = try CredentialPlacement.header(name: "X-Test", prefix: "Test ").requestHeader(secret: marker)
+    let bearer = CredentialPlacement.bearer.requestHeader(secret: marker)
+    let basic = CredentialPlacement.basic(username: "inert").requestHeader(secret: marker)
+    let custom = CredentialPlacement.header(name: "X-Test", prefix: "Test ").requestHeader(secret: marker)
     guard apiKey.name == "Authorization", apiKey.value == "APIKey " + marker,
           bearer.name == "Authorization", bearer.value == "Bearer " + marker,
           basic.name == "Authorization", basic.value == "Basic " + Data(("inert:" + marker).utf8).base64EncodedString(),
@@ -238,6 +78,21 @@ func runSelfTest() async throws {
         "credentials": [["service": "inert.test", "account": "inert", "type": "bearer"]],
         "operations": [["method": "GET", "path": "/", "body": "none", "response": "json"]]
     ]
+    let retiredCredential = ["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]
+    let commandOperations = [["command": "whoami"]]
+    try expectFailure("retired service-account profile", exitCode: 3) {
+        _ = try parseProfile(name: "fixture", dictionary: [
+            "origin": "https://team.1password.com", "credentials": [retiredCredential], "operations": commandOperations
+        ])
+    }
+    try expectFailure("unsupported credential type", exitCode: 3) {
+        _ = try parseCredential(retiredCredential)
+    }
+    var unsupportedOperation = profileFixture
+    unsupportedOperation["operations"] = commandOperations
+    try expectFailure("command in HTTP operation policy", exitCode: 3) {
+        _ = try parseProfile(name: "fixture", dictionary: unsupportedOperation)
+    }
     guard try parseProfile(name: "fixture", dictionary: profileFixture).proxy == nil else {
         throw fail("Self-test failed: unconfigured profile acquired a proxy.")
     }

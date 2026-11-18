@@ -44,7 +44,7 @@ private struct HTTPFixture {
     var profile: ProfilePolicy {
         ProfilePolicy(name: "inert", origin: origin, mediaType: .json, proxy: nil,
                       credentials: [CredentialPolicy(service: "inert.test", account: "inert", placement: .bearer)],
-                      operations: .http([operation]))
+                      operations: [operation])
     }
 
     func send(_ bytes: HTTPFixtureBytes, output: ProtectedResponseFile? = nil,
@@ -74,7 +74,7 @@ private func checkHTTPRecovery(_ fixture: HTTPFixture, directory: URL) async thr
             _ = try await fixture.send(HTTPFixtureBytes(data: data, interrupted: true),
                                        output: ProtectedResponseFile(path: path))
         }
-        guard try readProtectedInput(at: path, maximumBytes: maximumResponseBytes) == data else {
+        guard try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true) == data else {
             throw fail("Self-test failed: interrupted HTTP response bytes were lost.")
         }
     }
@@ -84,7 +84,7 @@ private func checkHTTPRecovery(_ fixture: HTTPFixture, directory: URL) async thr
     try await expectHTTPFailure("bounded overflow recovery") {
         _ = try await fixture.send(HTTPFixtureBytes(data: overflow), output: ProtectedResponseFile(path: path))
     }
-    guard try readProtectedInput(at: path, maximumBytes: maximumResponseBytes) == overflow.prefix(maximumResponseBytes) else {
+    guard try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true) == overflow.prefix(maximumResponseBytes) else {
         throw fail("Self-test failed: HTTP overflow recovery did not retain its bounded prefix.")
     }
 }
@@ -101,7 +101,7 @@ private func checkHTTPRecoveryRefusals(_ fixture: HTTPFixture, directory: URL) a
             _ = try await fixture.send(HTTPFixtureBytes(data: data, interrupted: true),
                                        output: ProtectedResponseFile(path: path))
         }
-        guard try readProtectedInput(at: path, maximumBytes: maximumResponseBytes).isEmpty else {
+        guard try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true).isEmpty else {
             throw fail("Self-test failed: unsafe interrupted HTTP output was persisted.")
         }
     }
@@ -119,7 +119,7 @@ private func checkHTTPResponseValidation(_ fixture: HTTPFixture, directory: URL)
             _ = try await fixture.send(HTTPFixtureBytes(data: data), output: ProtectedResponseFile(path: path),
                                        status: status, contentType: contentType, responseOrigin: responseOrigin)
         }
-        guard try readProtectedInput(at: path, maximumBytes: maximumResponseBytes).isEmpty else {
+        guard try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true).isEmpty else {
             throw fail("Self-test failed: rejected HTTP response was persisted.")
         }
     }
@@ -152,7 +152,7 @@ private func checkHTTPJSONCredentialEcho(_ fixture: HTTPFixture, directory: URL)
     let data = Data(raw.utf8)
     let path = directory.appendingPathComponent("escaped-duplicates.json").path
     _ = try await fixture.send(HTTPFixtureBytes(data: data), output: ProtectedResponseFile(path: path))
-    guard try readProtectedInput(at: path, maximumBytes: maximumResponseBytes) == data else {
+    guard try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true) == data else {
         throw fail("Self-test failed: accepted JSON member bytes changed.")
     }
     let encodings: [String.Encoding] = [.utf16, .utf16LittleEndian, .utf16BigEndian,
@@ -182,7 +182,7 @@ func runHTTPTransportSelfTests() async throws {
     let receipt = try await fixture.send(HTTPFixtureBytes(data: data), output: ProtectedResponseFile(path: path))
     guard let fields = receipt as? [String: Bool],
           fields == ["ok": true, "secret_output_file_written": true, "secret_output": false],
-          try readProtectedInput(at: path, maximumBytes: maximumResponseBytes) == data else {
+          try readRegularFile(at: path, maximumBytes: maximumResponseBytes, requirePrivateMode: true) == data else {
         throw fail("Self-test failed: HTTP protected output or fixed receipt.")
     }
     try await checkHTTPJSONCredentialEcho(fixture, directory: directory)

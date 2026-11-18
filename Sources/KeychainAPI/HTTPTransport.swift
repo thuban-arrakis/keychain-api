@@ -150,7 +150,7 @@ final class APITransport {
         request.setValue(profile.mediaType.rawValue, forHTTPHeaderField: "Accept")
 
         for (credential, secret) in zip(profile.credentials, secrets) {
-            let header = try credential.placement.requestHeader(secret: secret)
+            let header = credential.placement.requestHeader(secret: secret)
             request.setValue(header.value, forHTTPHeaderField: header.name)
         }
 

@@ -20,7 +20,8 @@ private struct RequestOptions {
     let secretOutputFile: String?
 }
 
-private func parseOptionPairs(_ arguments: [String], allowed: Set<String>) throws -> [String: String] {
+private func parseRequestOptions(_ arguments: [String]) throws -> RequestOptions {
+    let allowed: Set<String> = ["--method", "--path", "--body-file", "--secret-output-file"]
     var values: [String: String] = [:]
     var index = 0
     while index < arguments.count {
@@ -34,11 +35,6 @@ private func parseOptionPairs(_ arguments: [String], allowed: Set<String>) throw
         values[option] = arguments[index + 1]
         index += 2
     }
-    return values
-}
-
-private func parseRequestOptions(_ arguments: [String]) throws -> RequestOptions {
-    let values = try parseOptionPairs(arguments, allowed: ["--method", "--path", "--body-file", "--secret-output-file"])
     guard let method = values["--method"],
           let path = values["--path"],
           !method.isEmpty,
@@ -54,10 +50,7 @@ func operationForRequest(profile: ProfilePolicy, method: String, relativePath: S
           safeRelativeComponents(relativePath) != nil else {
         throw fail("The request method or path is invalid.", exitCode: 2)
     }
-    guard case .http(let operations) = profile.operations else {
-        throw fail("HTTP requests require an HTTP profile; use op for 1Password commands.", exitCode: 2)
-    }
-    guard let operation = operations.first(where: {
+    guard let operation = profile.operations.first(where: {
         $0.permits(method: method, relativePath: relativePath)
     }) else {
         throw fail("The requested method and path are not allowed by policy.", exitCode: 2)
@@ -72,7 +65,6 @@ private func usage() -> String {
       keychain-api status <profile>
       keychain-api authorize <profile>
       keychain-api request <profile> --method <METHOD> --path <PATH> [--body-file <JSON_FILE>] [--secret-output-file <NEW_JSON_FILE>]
-      keychain-api op <profile> --command <COMMAND> --secret-output-file <NEW_JSON_FILE> [--args-file <JSON_FILE>] [--input-file <PRIVATE_FILE>]
       keychain-api self-test
 
     Secret output: requires a NEW file in an existing owner-only directory.
@@ -91,7 +83,6 @@ struct CLIDependencies {
     let credentialExists: (CredentialPolicy) throws -> Bool
     let credentialValue: (CredentialPolicy) throws -> String
     let authorizeCredential: (CredentialPolicy, LAContext) throws -> Void
-    let onePasswordExecutable: () throws -> URL
     let stdout: (Data) -> Void
     let stderr: (Data) -> Void
 
@@ -101,7 +92,6 @@ struct CLIDependencies {
             credentialExists: KeychainReader.exists,
             credentialValue: KeychainReader.value,
             authorizeCredential: { try KeychainReader.authorize($0, context: $1) },
-            onePasswordExecutable: verifiedOnePasswordExecutable,
             stdout: { FileHandle.standardOutput.write($0) },
             stderr: { FileHandle.standardError.write($0) }
         )
@@ -142,38 +132,6 @@ private func handleAuthorize(_ arguments: [String], dependencies: CLIDependencie
         "credentials_read": profile.credentials.count, "network_used": false,
         "profile": profile.name, "secret_output": false, "secret_read": true
     ], write: dependencies.stdout)
-}
-
-private func handleOnePassword(_ arguments: [String], dependencies: CLIDependencies) throws {
-    guard arguments.count >= 6 else { throw fail("op arguments are incomplete.", exitCode: 2) }
-    let store = try dependencies.loadPolicy()
-    guard let profile = store.profiles[arguments[1]], case .onePassword = profile.operations else {
-        throw fail("op requires a 1Password service-account profile.", exitCode: 2)
-    }
-    let options = try parseOptionPairs(Array(arguments.dropFirst(2)), allowed: [
-        "--command", "--args-file", "--input-file", "--secret-output-file"
-    ])
-    guard let command = options["--command"], profile.operations.permits(command: command),
-          let outputPath = options["--secret-output-file"] else {
-        throw fail("op requires a policy-allowed command and a new protected output file.", exitCode: 2)
-    }
-    let rawArguments = try options["--args-file"].map { path -> [String] in
-        let data = try readProtectedInput(at: path, maximumBytes: maximumBodyBytes)
-        guard let array = try? JSONSerialization.jsonObject(with: data) as? [String] else {
-            throw fail("CLI arguments must be a private JSON array of non-secret strings.", exitCode: 3)
-        }
-        return array
-    } ?? []
-    try validateOnePasswordArguments(rawArguments, command: command)
-    let input = try options["--input-file"].map { try readProtectedInput(at: $0, maximumBytes: maximumResponseBytes) }
-    let preparedInput = try prepareOnePasswordInput(input, command: command, arguments: rawArguments)
-    let secretOutput = try ProtectedResponseFile(path: outputPath)
-    let executable = try dependencies.onePasswordExecutable()
-    let token = try dependencies.credentialValue(profile.credentials[0])
-    let result = try runOnePasswordCommand(profile: profile, token: token, executable: executable,
-                                          command: command, arguments: rawArguments, input: preparedInput)
-    try emitJSON(saveOnePasswordResult(result, command: command, token: token, output: secretOutput),
-                 write: dependencies.stdout)
 }
 
 private func handleRequest(_ arguments: [String], dependencies: CLIDependencies) async throws {
@@ -218,8 +176,6 @@ private func dispatchCLI(_ arguments: [String], dependencies: CLIDependencies) a
         try handleStatus(arguments, dependencies: dependencies)
     case "authorize":
         try handleAuthorize(arguments, dependencies: dependencies)
-    case "op":
-        try handleOnePassword(arguments, dependencies: dependencies)
     case "request":
         try await handleRequest(arguments, dependencies: dependencies)
     default:

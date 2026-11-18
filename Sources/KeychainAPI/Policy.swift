@@ -2,27 +2,19 @@ import Foundation
 
 enum CredentialPlacement {
     case bearer
-    case onePasswordServiceAccount
     case apiKey
     case basic(username: String)
     case header(name: String, prefix: String)
 
-    var isOnePassword: Bool {
-        if case .onePasswordServiceAccount = self { return true }
-        return false
-    }
-
     var headerName: String {
         switch self {
         case .header(let name, _): return name
-        case .bearer, .apiKey, .basic, .onePasswordServiceAccount: return "Authorization"
+        case .bearer, .apiKey, .basic: return "Authorization"
         }
     }
 
-    func requestHeader(secret: String) throws -> (name: String, value: String) {
+    func requestHeader(secret: String) -> (name: String, value: String) {
         switch self {
-        case .onePasswordServiceAccount:
-            throw fail("Service account tokens cannot be sent as HTTP headers.", exitCode: 3)
         case .bearer:
             return (headerName, "Bearer \(secret)")
         case .apiKey:
@@ -146,24 +138,13 @@ func parseSOCKSProxy(_ raw: Any?) throws -> SOCKSProxyPolicy? {
     return SOCKSProxyPolicy(port: UInt16(port))
 }
 
-enum ProfileOperations {
-    case http([OperationPolicy])
-    case onePassword(Set<String>)
-
-    func permits(command: String) -> Bool {
-        guard case .onePassword(let commands) = self else { return false }
-        return commands.contains(command)
-    }
-}
-
 struct ProfilePolicy {
     let name: String
     let origin: URL
     let mediaType: JSONMediaType
     let proxy: SOCKSProxyPolicy?
     let credentials: [CredentialPolicy]
-    let operations: ProfileOperations
-
+    let operations: [OperationPolicy]
 }
 
 struct PolicyStore {
@@ -244,16 +225,13 @@ func parseCredential(_ raw: Any) throws -> CredentialPolicy {
         throw fail("A policy profile contains an invalid credential reference.", exitCode: 3)
     }
 
-    if ["onepassword-service-account", "api-key", "bearer"].contains(type) {
+    let placement: CredentialPlacement
+    switch type {
+    case "api-key", "bearer":
         guard dictionary["header"] == nil, dictionary["prefix"] == nil, dictionary["username"] == nil else {
             throw fail("The credential policy contains unsupported fields for its authentication type.", exitCode: 3)
         }
-    }
-    let placement: CredentialPlacement
-    switch type {
-    case "onepassword-service-account": placement = .onePasswordServiceAccount
-    case "api-key": placement = .apiKey
-    case "bearer": placement = .bearer
+        placement = type == "api-key" ? .apiKey : .bearer
     case "basic":
         guard dictionary["header"] == nil,
               dictionary["prefix"] == nil,
@@ -386,26 +364,9 @@ func parseProfile(name: String, dictionary: [String: Any]) throws -> ProfilePoli
         }
     }
     let credentials = try rawCredentials.map(parseCredential)
-    let operations: ProfileOperations
-    if credentials.contains(where: { $0.placement.isOnePassword }) {
-        guard credentials.count == 1, proxy == nil, isTrustedOnePasswordOrigin(origin) else {
-            throw fail("A 1Password profile requires one credential, a trusted account origin, and no proxy.", exitCode: 3)
-        }
-        var commands = Set<String>()
-        for raw in rawOperations {
-            guard let operation = raw as? [String: Any], hasOnlyKeys(operation, allowed: ["command"]),
-                  let command = operation["command"] as? String, isSafeOnePasswordCommand(command),
-                  commands.insert(command).inserted else {
-                throw fail("1Password operations must contain unique command entries.", exitCode: 3)
-            }
-        }
-        operations = .onePassword(commands)
-    } else {
-        let httpOperations = try rawOperations.map(parseOperation)
-        guard Set(httpOperations.map(\.uniqueKey)).count == httpOperations.count else {
-            throw fail("A policy profile defines an operation more than once.", exitCode: 3)
-        }
-        operations = .http(httpOperations)
+    let operations = try rawOperations.map(parseOperation)
+    guard Set(operations.map(\.uniqueKey)).count == operations.count else {
+        throw fail("A policy profile defines an operation more than once.", exitCode: 3)
     }
 
     var headerNames = Set<String>()
