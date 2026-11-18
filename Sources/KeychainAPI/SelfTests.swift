@@ -78,13 +78,18 @@ func runSelfTest() async throws {
         "credentials": [["service": "inert.test", "account": "inert", "type": "bearer"]],
         "operations": [["method": "GET", "path": "/", "body": "none", "response": "json"]]
     ]
-    var unsupportedCredential = profileFixture
-    unsupportedCredential["credentials"] = [["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]]
+    let retiredCredential = ["service": "inert.test", "account": "inert", "type": "onepassword-service-account"]
+    let commandOperations = [["command": "whoami"]]
+    try expectFailure("retired service-account profile", exitCode: 3) {
+        _ = try parseProfile(name: "fixture", dictionary: [
+            "origin": "https://team.1password.com", "credentials": [retiredCredential], "operations": commandOperations
+        ])
+    }
     try expectFailure("unsupported credential type", exitCode: 3) {
-        _ = try parseProfile(name: "fixture", dictionary: unsupportedCredential)
+        _ = try parseCredential(retiredCredential)
     }
     var unsupportedOperation = profileFixture
-    unsupportedOperation["operations"] = [["command": "whoami"]]
+    unsupportedOperation["operations"] = commandOperations
     try expectFailure("command in HTTP operation policy", exitCode: 3) {
         _ = try parseProfile(name: "fixture", dictionary: unsupportedOperation)
     }

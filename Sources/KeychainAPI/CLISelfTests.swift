@@ -17,18 +17,20 @@ func runCLISelfTests() async throws {
         .appendingPathComponent("keychain-cli-test-" + UUID().uuidString, isDirectory: true)
     try files.createDirectory(at: directory, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
     defer { try? files.removeItem(at: directory) }
-    let output = directory.appendingPathComponent("existing.json")
+    let existingJSON = directory.appendingPathComponent("existing.json")
+    let deniedOutput = directory.appendingPathComponent("denied.json")
     let existing = Data("{}".utf8)
-    _ = try ProtectedResponseFile(path: output.path).commit(existing)
+    _ = try ProtectedResponseFile(path: existingJSON.path).commit(existing)
     let request = ["request", "http", "--method", "GET", "--path"]
 
     let cases: [(arguments: [String], exitCode: Int32, policyLoads: Int)] = [
         (["--version"], 0, 0),
         (["--version", "extra"], 2, 0),
         (["--verion"], 2, 0),
-        (["op", "http", "--command", "whoami", "--secret-output-file", output.path], 2, 0),
-        (request + ["/denied"], 2, 1),
-        (request + ["/status", "--secret-output-file", output.path], 3, 1)
+        (["op", "http", "--command", "whoami", "--secret-output-file", existingJSON.path], 2, 0),
+        (request + ["/denied", "--secret-output-file", deniedOutput.path], 2, 1),
+        (request + ["/status", "--body-file", existingJSON.path], 2, 1),
+        (request + ["/status", "--secret-output-file", existingJSON.path], 3, 1)
     ]
     for test in cases {
         var stdout = Data()
@@ -56,6 +58,7 @@ func runCLISelfTests() async throws {
             try checkCLI(stdout.isEmpty && !stderr.isEmpty, "refusal output")
         }
     }
-    try checkCLI(try readRegularFile(at: output.path, maximumBytes: 4096, requirePrivateMode: true) == existing,
+    try checkCLI(!files.fileExists(atPath: deniedOutput.path), "denied request created an output file")
+    try checkCLI(try readRegularFile(at: existingJSON.path, maximumBytes: 4096, requirePrivateMode: true) == existing,
                  "existing output preserved")
 }
