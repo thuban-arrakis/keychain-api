@@ -190,23 +190,3 @@ final class ProtectedResponseFile {
         return ["ok": true, "secret_output_file_written": true, "secret_output": false]
     }
 }
-
-func readProtectedInput(at path: String, maximumBytes: Int) throws -> Data {
-    let parent = try openPrivateParent(of: path)
-    defer { close(parent) }
-    let name = URL(fileURLWithPath: path).lastPathComponent
-    let fd = openat(parent, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
-    guard fd >= 0 else { throw fail("Private input could not be opened safely.", exitCode: 3) }
-    let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: true)
-    var info = stat()
-    guard fstat(fd, &info) == 0, (info.st_mode & S_IFMT) == S_IFREG,
-          info.st_uid == geteuid(), (info.st_mode & 0o077) == 0,
-          info.st_nlink == 1, info.st_size >= 0, info.st_size <= maximumBytes,
-          hasNoExtendedACL(fd) else {
-        throw fail("Private input failed ownership, permissions, or size checks.", exitCode: 3)
-    }
-    var data = Data()
-    try readBoundedData(from: handle, into: &data, maximumBytes: maximumBytes,
-                        overflow: fail("Private input exceeded its size limit.", exitCode: 3))
-    return data
-}
